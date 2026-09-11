@@ -1,0 +1,19 @@
+[package]
+name = "llm-visuals"
+version = "0.1.0"
+edition = "2021"
+description = "Live terminal dashboard for a locally running LLM: throughput, GPUs, context, MTP acceptance, layer and expert activity"
+license = "MIT"
+repository = "https://github.com/DingoOz/llm-visuals"
+readme = "README.md"
+keywords = ["llm", "tui", "llama-cpp", "gpu", "monitoring"]
+categories = ["command-line-utilities", "visualization"]
+
+[dependencies]
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+chrono = "0.4"

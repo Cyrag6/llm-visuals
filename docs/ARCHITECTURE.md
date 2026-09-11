@@ -1,0 +1,103 @@
+# Architecture
+
+llm-visuals is a single Rust binary built on [ratatui](https://ratatui.rs) and
+tokio. It has no agents inside the inference server: everything it shows is
+polled over HTTP or read from `nvidia-smi`, then derived and smoothed locally.
+
+```
+                ┌──────────────┐  every poll_ms (200 ms)   ┌───────────────┐
+ llama-server ──┤ /slots       ├──────────────────────────►│ observe.rs    │
+                │ /metrics     │                            │ LiveStats     │
+                │ /experts     │                            │ SpecMetrics   │
+                └──────────────┘                            │ ExpertStats   │
+                                                            └──────┬────────┘
+                ┌──────────────┐  every 200 ms                     │ mpsc channels
+ nvidia-smi ────┤ --query-gpu  ├──────────────► gpu.rs ────────────┤
+                └──────────────┘                GpuStats           ▼
+                                                        ┌────────────────────┐
+ model_detect.rs ─ /proc + compute apps ─► DetectedModel│ main.rs event loop │
+ gguf.rs ──────── GGUF header ───────────► GgufInfo     │  ~30 fps           │
+                                                        └───┬──────────┬─────┘
+                                                            │          │
+                                                 perf.rs ◄──┘          └──► fade.rs
+                                                 rates, TTFT,               attack/release
+                                                 request log,               smoothing,
+                                                 MTP acceptance,            expert heat
+                                                 peak hold
+                                                            │          │
+                                                            ▼          ▼
+                                                        ┌────────────────────┐
+                                                        │ render.rs          │
+                                                        │ Dashboard → panels │
+                                                        └────────────────────┘
+```
+
+## Modules
+
+| Module | Responsibility |
+|---|---|
+| `main.rs` | CLI parsing, terminal setup, spawning pollers, the frame loop, key handling |
+| `config.rs` | clap arguments and `ViewMode` |
+| `model_detect.rs` | finds inference processes via `nvidia-smi --query-compute-apps` and `/proc`, parses their command lines (model path, port, ctx size, tensor split, spec mode) |
+| `gguf.rs` | reads the GGUF header without loading tensors; maps layers to GPUs from `--tensor-split` |
+| `observe.rs` | HTTP GET with timeouts; parsers for `/slots`, `/metrics` (Prometheus text) and `/experts` |
+| `gpu.rs` | `nvidia-smi` CSV collector on a `spawn_blocking` thread; smooth random-walk demo GPUs |
+| `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers |
+| `fade.rs` | time-based smoothing so the UI breathes: fast attack, slow release; per-expert heat that cools exponentially |
+| `demo.rs` | a synthetic server (prefill → decode → idle loop) that emits `LiveStats`, `SpecMetrics`, `ExpertStats` and GPU samples through the same channels |
+| `colors.rs` | truecolor / 256-colour gating, gradients, palette constants, themes |
+| `render.rs` | the `Dashboard` view-model and every panel; gauges, sparklines, big digits, layout rules |
+| `pipeline.rs`, `llm/` | attention buffers for the optional Python transformers bridge (`--model <hf id>`) |
+
+## Data contracts
+
+**`/slots`** (always on in llama-server) gives per slot: `n_ctx`, `is_processing`,
+`id_task`, `n_prompt_tokens`, `n_prompt_tokens_processed`, `n_prompt_tokens_cache`,
+`next_token[0].n_decoded`, `params["speculative.types"]`. Rates are deltas of
+these over `RateWindow`s; a request record starts when `id_task` changes or the
+slot turns busy, and ends when it turns idle.
+
+**`/metrics`** (needs `--metrics`) gives cumulative
+`spec_decode_num_draft_tokens_total`, `spec_decode_num_accepted_tokens_total`,
+`spec_decode_num_drafts_total`, `tokens_predicted_total`. Acceptance is the
+windowed ratio of the first two.
+
+**`/experts`** (needs the patch in `patches/`) gives per MoE layer the newest 16
+routings and a 256-token histogram. See `patches/README.md`.
+
+Each optional endpoint is probed at start and after a rescan; after three
+failures the poller stops asking, so unpatched or older servers cost nothing.
+
+## Timing model
+
+- Pollers run on their own tasks and push into bounded channels.
+- The frame loop drains every channel, feeds `PerfTracker` and `FadeState`,
+  builds a `Dashboard` of borrowed references, and renders. It sleeps ~33 ms.
+- `FadeState::tick` uses wall-clock `dt`, so smoothing looks the same at any
+  frame rate. Attack ≈ 180 ms, release ≈ 2.4 s for layer tiles; expert heat
+  cools with τ = 0.6 s.
+- `RateWindow` stores `(interval start, interval end, tokens)` so a rate is
+  tokens over real elapsed time, including the first interval, and drops to
+  zero within one window of the counter stopping.
+
+## Rendering rules
+
+- Colour comes from `colors::rgb`, which quantises to the xterm-256 cube when
+  the terminal is not truecolor (auto-detected from `COLORTERM`, `TERM`,
+  `TERM_PROGRAM`, VTE/Konsole markers; override with `--color`).
+- Panels use rounded borders with an accent-coloured left title. A right-aligned
+  border title is attached only if it cannot collide with the left one
+  (`with_right`); otherwise the information moves into the body or is shed.
+- Gauges have half-cell precision and an optional white peak-hold notch.
+- Sparklines are right-aligned in time (newest at the right edge) and coloured
+  by level with a gradient.
+- Layout sheds panels below 26 rows (requests) and 20 rows (context/MTP); the
+  GPU line sheds PCIe, fan, clock, temperature before shrinking its gauge.
+
+## Testing
+
+`cargo test` runs unit tests for every parser (real `nvidia-smi`, `/slots`,
+`/metrics` and `/experts` samples), the rate window, request lifecycle, peak
+hold, expert heat, colour quantisation, sparkline shapes and formatting. UI
+layout is checked by running the binary in tmux and capturing panes; the
+`docs/*.svg` screenshots are produced that way.

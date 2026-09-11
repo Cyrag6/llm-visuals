@@ -12,6 +12,8 @@ pub enum ViewMode {
     Heatmap,
     /// MoE expert map zoom.
     MoE,
+    /// Memory pipeline: disk → RAM → PCIe → VRAM → prefill → decode meters.
+    Bandwidth,
 }
 
 impl std::fmt::Display for ViewMode {
@@ -21,6 +23,7 @@ impl std::fmt::Display for ViewMode {
             ViewMode::Perf => write!(f, "perf"),
             ViewMode::Heatmap => write!(f, "layers"),
             ViewMode::MoE => write!(f, "moe"),
+            ViewMode::Bandwidth => write!(f, "bandwidth"),
         }
     }
 }

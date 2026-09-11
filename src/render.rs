@@ -10,13 +10,14 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::bandwidth::{self, StageId};
 use crate::colors::{self as pal, ColorTheme};
 use crate::config::ViewMode;
 use crate::fade::FadeState;
 use crate::gpu::GpuStats;
 use crate::model_detect::DetectedModel;
 use crate::observe::{ExpertStats, LiveStats};
-use crate::perf::{PerfTracker, Phase, RequestRecord};
+use crate::perf::{Meter, PerfTracker, Phase, RequestRecord};
 use crate::pipeline::{GeneratedText, TokenBuffer};
 
 const HEATMAP_TOKEN_WIDTH: usize = 40;
@@ -89,6 +90,25 @@ impl Renderer {
     }
 
     fn render_view(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        if d.view == ViewMode::Bandwidth {
+            let verdict_h = if area.height >= 24 { 4 } else { 0 };
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(12),
+                    Constraint::Length(verdict_h),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            self.render_header(frame, rows[0], d);
+            self.render_pipeline(frame, rows[1], d);
+            if rows[2].height > 0 {
+                self.render_verdict(frame, rows[2], d);
+            }
+            self.render_footer(frame, rows[3], d);
+            return;
+        }
         let n_gpus = d.gpus.len();
         let h = area.height;
         let gpu_rows = (3 * n_gpus.max(1) as u16 + 2).max(9);
@@ -114,7 +134,7 @@ impl Renderer {
                 Constraint::Length(if show_requests { 12 } else { 0 }),
                 Constraint::Length(1),
             ],
-            ViewMode::Heatmap | ViewMode::MoE => vec![
+            ViewMode::Heatmap | ViewMode::MoE | ViewMode::Bandwidth => vec![
                 Constraint::Length(3),
                 Constraint::Length(0),
                 Constraint::Length(ctx_h),
@@ -1365,6 +1385,7 @@ impl Renderer {
         spans.extend(key("p", "perf", d.view == ViewMode::Perf));
         spans.extend(key("h", "layers", d.view == ViewMode::Heatmap));
         spans.extend(key("m", "experts", d.view == ViewMode::MoE));
+        spans.extend(key("b", "bandwidth", d.view == ViewMode::Bandwidth));
         spans.extend(key("t", &format!("theme:{}", d.theme_name), false));
         spans.extend(key("r", "rescan", false));
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1378,6 +1399,511 @@ impl Renderer {
             Paragraph::new(Line::from(spans)).style(Style::default().bg(pal::c(pal::PANEL))),
             area,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory pipeline (b): disk → RAM → PCIe → VRAM → prefill → decode
+// ---------------------------------------------------------------------------
+
+/// One vertical VU channel inside a stage.
+struct Channel<'a> {
+    label: String,
+    meter: &'a Meter,
+    /// Compact reading printed under the bar.
+    text: String,
+}
+
+struct Stage<'a> {
+    id: StageId,
+    title: &'static str,
+    accent: (u8, u8, u8),
+    value: String,
+    unit: &'static str,
+    /// Tag after the unit, e.g. "est".
+    tag: &'static str,
+    channels: Vec<Channel<'a>>,
+    facts: Vec<Line<'static>>,
+    /// Shown instead of meters when the stage has no data source.
+    missing: Option<String>,
+}
+
+impl<'a> Stage<'a> {
+    fn activity(&self) -> f32 {
+        self.channels.iter().map(|c| c.meter.frac()).fold(0.0, f32::max)
+    }
+}
+
+impl Renderer {
+    fn pipeline_stages<'a>(&self, d: &'a Dashboard) -> Vec<Stage<'a>> {
+        let bw = &d.perf.bw;
+        let host = &bw.host;
+        let layout = &bw.layout;
+        let dim = |s: String| Line::from(Span::styled(s, Style::default().fg(pal::c(pal::TEXT_DIM))));
+        let fact = |k: &str, v: String, c: (u8, u8, u8)| {
+            Line::from(vec![
+                Span::styled(format!("{k} "), Style::default().fg(pal::c(pal::TEXT_DIM))),
+                Span::styled(v, Style::default().fg(pal::c(c))),
+            ])
+        };
+        let gb = |b: u64| format!("{:.1}G", b as f32 / 1e9);
+        let mut stages: Vec<Stage> = Vec::with_capacity(6);
+
+        // ---- disk ---------------------------------------------------------
+        let mut facts = vec![fact("proc", format!("{:.0} MB/s", bw.proc_disk_mb_s), pal::TEXT)];
+        facts.push(fact(
+            "faults",
+            format!("{:.0}/s", bw.majflt_per_s),
+            if bw.majflt_per_s > 50.0 { pal::AMBER } else { pal::TEXT },
+        ));
+        if layout.known {
+            facts.push(fact("model", gb(layout.total_bytes), pal::TEXT));
+        }
+        stages.push(Stage {
+            id: StageId::Disk,
+            title: "DISK",
+            accent: pal::AMBER,
+            value: fmt_compact(bw.disk.value),
+            unit: "MB/s",
+            tag: "",
+            channels: vec![Channel {
+                label: "read".into(),
+                meter: &bw.disk,
+                text: fmt_compact(bw.disk.value),
+            }],
+            facts,
+            missing: if bw.host_seen && host.disk_read_bytes.is_none() {
+                Some("no /proc/diskstats".into())
+            } else {
+                None
+            },
+        });
+
+        // ---- RAM ----------------------------------------------------------
+        let mut facts = Vec::new();
+        if let Some(r) = host.rss_file_bytes {
+            facts.push(fact("resident", gb(r), pal::VIOLET));
+        }
+        if layout.known {
+            let c = if layout.cpu_bytes > layout.total_bytes / 50 { pal::AMBER } else { pal::TEXT_DIM };
+            facts.push(fact("cpu-side", format!("~{}", gb(layout.cpu_bytes)), c));
+        }
+        if let Some(a) = host.mem_available_bytes {
+            facts.push(fact("avail", gb(a), pal::TEXT));
+        }
+        stages.push(Stage {
+            id: StageId::Ram,
+            title: "RAM",
+            accent: pal::VIOLET,
+            value: fmt_compact(bw.ram.value),
+            unit: "GB/s",
+            tag: "est",
+            channels: vec![Channel {
+                label: "cpu".into(),
+                meter: &bw.ram,
+                text: fmt_compact(bw.ram.value),
+            }],
+            facts,
+            missing: if layout.known { None } else { Some("no tensor table".into()) },
+        });
+
+        // ---- PCIe ---------------------------------------------------------
+        let mut channels = Vec::new();
+        let mut facts = Vec::new();
+        let mut total_rx = 0.0f32;
+        for g in d.gpus {
+            let i = g.index as usize;
+            if let Some(m) = bw.pcie_rx.get(i) {
+                total_rx += m.value;
+                channels.push(Channel {
+                    label: format!("G{i}"),
+                    meter: m,
+                    text: fmt_compact(m.value),
+                });
+                let cap = m
+                    .full_scale
+                    .map(|c| format!("{:.1}G/s", c / 1000.0))
+                    .unwrap_or_else(|| "?".into());
+                facts.push(fact(&format!("G{i}"), format!("x{} g{} {cap}", g.pcie_width, g.pcie_gen), pal::TEXT));
+            }
+        }
+        stages.push(Stage {
+            id: StageId::Pcie,
+            title: "PCIe",
+            accent: pal::BLUE,
+            value: fmt_compact(total_rx),
+            unit: "MB/s",
+            tag: "",
+            channels,
+            facts,
+            missing: if !bw.host_seen {
+                None
+            } else if d.gpus.is_empty() {
+                Some("no GPU".into())
+            } else if !host.pcie_ok {
+                Some("nvidia-smi dmon\nunavailable".into())
+            } else {
+                None
+            },
+        });
+
+        // ---- VRAM ---------------------------------------------------------
+        let mut channels = Vec::new();
+        let mut busiest = 0.0f32;
+        for g in d.gpus {
+            let i = g.index as usize;
+            if let Some(m) = bw.vram_busy.get(i) {
+                busiest = busiest.max(m.value);
+                channels.push(Channel {
+                    label: format!("G{i}"),
+                    meter: m,
+                    text: format!("{:.0}%", m.value),
+                });
+            }
+        }
+        let mut facts = vec![fact("weights", format!("{:.1} GB/s", bw.vram.value), pal::TEAL)];
+        if layout.known {
+            facts.push(fact("per step", gb(layout.per_step().1 as u64), pal::TEXT));
+        }
+        facts.push(dim("mem ctrl busy %".into()));
+        stages.push(Stage {
+            id: StageId::Vram,
+            title: "VRAM",
+            accent: pal::TEAL,
+            value: format!("{busiest:.0}"),
+            unit: "%",
+            tag: "busy",
+            channels,
+            facts,
+            missing: if d.gpus.is_empty() { Some("no GPU".into()) } else { None },
+        });
+
+        // ---- prefill ------------------------------------------------------
+        let p = d.perf;
+        let facts = vec![
+            fact("peak", fmt_rate(p.peak_prefill_tps), pal::TEXT),
+            fact("ubatch", format!("{}", layout.ubatch.max(1)), pal::TEXT),
+            dim("compute bound".into()),
+        ];
+        stages.push(Stage {
+            id: StageId::Prefill,
+            title: "PREFILL",
+            accent: pal::MAGENTA,
+            value: fmt_compact(p.prefill_tps_smooth),
+            unit: "tok/s",
+            tag: "",
+            channels: vec![Channel {
+                label: "in".into(),
+                meter: &bw.prefill,
+                text: fmt_compact(bw.prefill.value),
+            }],
+            facts,
+            missing: None,
+        });
+
+        // ---- decode -------------------------------------------------------
+        let mut facts = vec![fact("peak", fmt_rate(p.peak_decode_tps), pal::TEXT)];
+        if p.spec.available {
+            facts.push(fact("steps", format!("{:.1}/s", p.spec.steps_per_sec), pal::AMBER));
+        }
+        if layout.known {
+            facts.push(fact("per tok", gb(layout.active_bytes), pal::TEXT));
+        }
+        stages.push(Stage {
+            id: StageId::Decode,
+            title: "DECODE",
+            accent: pal::CYAN,
+            value: fmt_compact(p.decode_tps_smooth),
+            unit: "tok/s",
+            tag: "",
+            channels: vec![Channel {
+                label: "out".into(),
+                meter: &bw.decode,
+                text: fmt_compact(bw.decode.value),
+            }],
+            facts,
+            missing: None,
+        });
+        stages
+    }
+
+    fn render_pipeline(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let layout = &d.perf.bw.layout;
+        let title = " ◆ MEMORY PIPELINE  disk → RAM → PCIe → VRAM → prefill → decode ";
+        let right_txt = if layout.known {
+            format!(
+                " {} tensors · {:.1} GB · {:.1} GB per step · {}",
+                d.detected.and_then(|m| m.tensors.as_ref()).map(|t| t.n_tensors).unwrap_or(0),
+                layout.total_bytes as f32 / 1e9,
+                layout.active_bytes as f32 / 1e9,
+                if layout.cpu_bytes > layout.total_bytes / 50 {
+                    format!("~{:.1} GB on CPU ", layout.cpu_bytes as f32 / 1e9)
+                } else {
+                    "all in VRAM ".into()
+                }
+            )
+        } else {
+            " no GGUF tensor table: RAM / VRAM streams unknown ".into()
+        };
+        let right = Line::from(Span::styled(right_txt, Style::default().fg(pal::c(pal::TEXT_DIM)))).right_aligned();
+        let (block, _) = with_right(panel(title, pal::CYAN), title, right, area);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 8 || inner.width < 40 {
+            frame.render_widget(
+                Paragraph::new("terminal too small for the pipeline view")
+                    .style(Style::default().fg(pal::c(pal::TEXT_DIM))),
+                inner,
+            );
+            return;
+        }
+        let stages = self.pipeline_stages(d);
+        let verdict = bandwidth::assess(d.perf, d.gpus);
+        let n = stages.len();
+        let w = inner.width as usize;
+        let gutter = if w >= n * 18 + (n - 1) * 3 {
+            3
+        } else if w >= n * 12 + (n - 1) {
+            1
+        } else {
+            0
+        };
+        let col_w = (w - gutter * (n - 1)) / n;
+        // Row plan shared by every column so the arrows line up.
+        let h = inner.height as usize;
+        let facts_h = stages.iter().map(|s| s.facts.len()).max().unwrap_or(0).min(3);
+        let facts_h = if h >= 12 { facts_h } else { 0 };
+        let label_rows = 2;
+        let meter_h = h.saturating_sub(3 + label_rows + facts_h).max(3);
+        let meter_top = 3usize;
+        for (i, st) in stages.iter().enumerate() {
+            let x = inner.x + (i * (col_w + gutter)) as u16;
+            let rect = Rect::new(x, inner.y, col_w as u16, inner.height);
+            let flagged = verdict.stage == Some(st.id);
+            self.render_stage(frame, rect, st, flagged, meter_top, meter_h, facts_h);
+            if gutter > 0 && i + 1 < n {
+                let gx = x + col_w as u16;
+                let gy = inner.y + (meter_top + meter_h / 2) as u16;
+                let active = st.activity() > 0.02 && d.perf.phase != Phase::Idle;
+                let arrow = if gutter >= 3 {
+                    if active {
+                        let k = (self.t() * 8.0) as usize % 3;
+                        ["●─▶", "─●▶", "──●"][k]
+                    } else {
+                        "──▶"
+                    }
+                } else {
+                    "▶"
+                };
+                let col = if active { pal::c(st.accent) } else { pal::c(pal::TEXT_MUTED) };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(arrow, Style::default().fg(col))),
+                    Rect::new(gx, gy, gutter as u16, 1),
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_stage(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        st: &Stage,
+        flagged: bool,
+        meter_top: usize,
+        meter_h: usize,
+        facts_h: usize,
+    ) {
+        let w = area.width as usize;
+        let h = area.height as usize;
+        let mut lines: Vec<Line> = Vec::with_capacity(h);
+        // Title, inverted and glowing when this stage is the bound.
+        if flagged {
+            let glow = 0.7 + 0.3 * self.pulse();
+            let txt = if w >= 16 { format!(" {} ◀ BOUND ", st.title) } else { format!(" {} ◀", st.title) };
+            lines.push(Line::from(Span::styled(
+                txt,
+                Style::default()
+                    .fg(pal::c((10, 12, 18)))
+                    .bg(pal::c(pal::dim_rgb(st.accent, glow)))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", st.title),
+                Style::default().fg(pal::c(st.accent)).add_modifier(Modifier::BOLD),
+            )));
+        }
+        // Reading.
+        let live = st.activity() > 0.0 || st.value != "0" && st.value != "0.0";
+        let mut spans = vec![
+            Span::styled(
+                format!(" {}", st.value),
+                Style::default()
+                    .fg(if live { pal::c(pal::WHITE) } else { pal::c(pal::TEXT_MUTED) })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {}", st.unit), Style::default().fg(pal::c(pal::TEXT_DIM))),
+        ];
+        let reading_w: usize = spans.iter().map(|x| x.content.chars().count()).sum();
+        if !st.tag.is_empty() && reading_w + st.tag.len() + 1 <= w {
+            spans.push(Span::styled(
+                format!(" {}", st.tag),
+                Style::default().fg(pal::c(pal::TEXT_MUTED)).add_modifier(Modifier::ITALIC),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+
+        // Meters: a tick column, then one bar per channel.
+        let tick_w = 5usize;
+        let n_ch = st.channels.len().max(1);
+        let avail = w.saturating_sub(tick_w + 1);
+        let bar_w = ((avail + 1) / n_ch).saturating_sub(1).clamp(1, 6);
+        let shared_scale = st
+            .channels
+            .first()
+            .map(|c| c.meter.scale())
+            .filter(|s| st.channels.iter().all(|c| (c.meter.scale() - s).abs() < 1e-3));
+        let pct_ticks = shared_scale.is_none() || st.unit == "%";
+        let top = meter_h.saturating_sub(1);
+        let tick_at = |t: f32| -> usize { top - ((t * top as f32).round() as usize).min(top) };
+        let tick = |r: usize| -> String {
+            let fmt = |t: f32| -> String {
+                if pct_ticks {
+                    format!("{:.0}%", t * 100.0)
+                } else {
+                    fmt_compact(shared_scale.unwrap_or(0.0) * t)
+                }
+            };
+            if r == 0 {
+                fmt(1.0)
+            } else if r == top {
+                "0".into()
+            } else if meter_h >= 5 && r == tick_at(0.5) {
+                fmt(0.5)
+            } else if meter_h >= 12 && (r == tick_at(0.25) || r == tick_at(0.75)) {
+                fmt(if r == tick_at(0.25) { 0.25 } else { 0.75 })
+            } else {
+                String::new()
+            }
+        };
+        let bars: Vec<Vec<Vec<Span<'static>>>> = st
+            .channels
+            .iter()
+            .map(|c| vmeter(c.meter.frac(), c.meter.hold_frac(), meter_h, bar_w))
+            .collect();
+        for r in 0..meter_h {
+            let mut spans = vec![Span::styled(
+                format!("{:>tick_w$} ", tick(r)),
+                Style::default().fg(pal::c(pal::TEXT_MUTED)),
+            )];
+            if let Some(msg) = &st.missing {
+                if r == meter_h / 2 {
+                    let msg_line = msg.lines().next().unwrap_or("");
+                    spans.push(Span::styled(
+                        truncate(msg_line, w.saturating_sub(tick_w + 1)),
+                        Style::default().fg(pal::c(pal::AMBER)),
+                    ));
+                } else if r == meter_h / 2 + 1 {
+                    if let Some(second) = msg.lines().nth(1) {
+                        spans.push(Span::styled(
+                            truncate(second, w.saturating_sub(tick_w + 1)),
+                            Style::default().fg(pal::c(pal::AMBER)),
+                        ));
+                    }
+                }
+                lines.push(Line::from(spans));
+                continue;
+            }
+            for (i, b) in bars.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.extend(b[r].iter().cloned());
+            }
+            lines.push(Line::from(spans));
+        }
+        // Channel labels and readings under the bars.
+        let cell = bar_w + 1;
+        let mut lab = vec![Span::raw(" ".repeat(tick_w + 1))];
+        let mut val = vec![Span::raw(" ".repeat(tick_w + 1))];
+        for c in &st.channels {
+            let label: String = c.label.chars().take(cell).collect();
+            lab.push(Span::styled(
+                format!("{label:<cell$}"),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
+            let t: String = c.text.chars().take(cell).collect();
+            let col = if c.meter.frac() > 0.0 { pal::vu(c.meter.frac()) } else { pal::c(pal::TEXT_MUTED) };
+            val.push(Span::styled(format!("{t:<cell$}"), Style::default().fg(col)));
+        }
+        if st.missing.is_none() {
+            lines.push(Line::from(lab));
+            // Readings need room to stay apart; drop them when bars are thin.
+            if cell >= 5 || st.channels.len() == 1 {
+                lines.push(Line::from(val));
+            } else {
+                lines.push(Line::from(""));
+            }
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
+        let _ = meter_top;
+        for f in st.facts.iter().take(facts_h) {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(fit_spans(&f.spans, w.saturating_sub(2)));
+            lines.push(Line::from(spans));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    }
+
+    fn render_verdict(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let v = bandwidth::assess(d.perf, d.gpus);
+        let accent = match v.stage {
+            Some(StageId::Disk) => pal::AMBER,
+            Some(StageId::Ram) => pal::VIOLET,
+            Some(StageId::Pcie) => pal::BLUE,
+            Some(StageId::Vram) => pal::TEAL,
+            Some(StageId::Prefill) => pal::MAGENTA,
+            Some(StageId::Decode) => pal::CYAN,
+            None => pal::TEXT_DIM,
+        };
+        let title = " ◆ BOTTLENECK ";
+        let note = Line::from(Span::styled(
+            " RAM / VRAM streams = bytes per step × steps per s from the GGUF tensor table ",
+            Style::default().fg(pal::c(pal::TEXT_MUTED)),
+        ))
+        .right_aligned();
+        let (block, _) = with_right(panel(title, pal::AMBER), title, note, area);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+        let w = inner.width as usize;
+        let mark = if v.stage.is_some() && d.perf.phase != Phase::Idle {
+            let k = 0.5 + 0.5 * self.pulse();
+            Span::styled(" ● ", Style::default().fg(pal::c(pal::dim_rgb(accent, k))))
+        } else {
+            Span::styled(" ○ ", Style::default().fg(pal::c(pal::TEXT_MUTED)))
+        };
+        let lines = vec![
+            Line::from(vec![
+                mark,
+                Span::styled(
+                    truncate(&v.headline, w.saturating_sub(4)),
+                    Style::default().fg(pal::c(accent)).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!("   {}", truncate(&v.detail, w.saturating_sub(4))),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 }
 
@@ -1440,6 +1966,83 @@ fn gauge(frac: f32, peak: Option<f32>, width: usize, style: GaugeStyle) -> Vec<S
             }
         })
         .collect()
+}
+
+/// Vertical VU meter, rows top→bottom: eighth-block precision, green at the
+/// foot to red at the top, and a white peak-hold line that sits then falls.
+fn vmeter(frac: f32, hold: f32, height: usize, width: usize) -> Vec<Vec<Span<'static>>> {
+    let height = height.max(1);
+    let frac = frac.clamp(0.0, 1.0);
+    let hold = hold.clamp(0.0, 1.0);
+    let total = (frac * height as f32 * 8.0).round() as usize;
+    // The cell whose top edge is nearest the held level, only when it is
+    // above the live level so it never hides a lit cell.
+    let hold_row = if hold > frac + 1e-3 {
+        let cell = ((hold * height as f32).ceil() as usize).clamp(1, height) - 1;
+        Some(height - 1 - cell)
+    } else {
+        None
+    };
+    (0..height)
+        .map(|r| {
+            let from_bottom = height - 1 - r;
+            let e = total.saturating_sub(from_bottom * 8).min(8);
+            let pos = (from_bottom as f32 + 0.5) / height as f32;
+            let col = pal::vu(pos);
+            let track = Style::default().bg(pal::c(pal::TRACK));
+            let span = if hold_row == Some(r) && e < 8 {
+                Span::styled("▔".repeat(width), track.fg(pal::c(pal::WHITE)))
+            } else if e == 8 {
+                Span::styled("█".repeat(width), Style::default().fg(col))
+            } else if e == 0 {
+                Span::styled(" ".repeat(width), track)
+            } else {
+                let ch = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"][e - 1];
+                Span::styled(ch.repeat(width), track.fg(col))
+            };
+            vec![span]
+        })
+        .collect()
+}
+
+/// Cut a run of spans to `width` cells, ending with an ellipsis if anything
+/// was lost, so a narrow column never shows a half-word.
+fn fit_spans(spans: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= width {
+        return spans.to_vec();
+    }
+    let mut out = Vec::new();
+    let mut left = width.saturating_sub(1);
+    for s in spans {
+        let n = s.content.chars().count();
+        if n <= left {
+            out.push(s.clone());
+            left -= n;
+        } else {
+            let cut: String = s.content.chars().take(left).collect();
+            out.push(Span::styled(cut + "…", s.style));
+            return out;
+        }
+    }
+    out
+}
+
+/// "0", "4.2", "128", "1.3k", "12M": four characters or fewer for meter feet.
+fn fmt_compact(v: f32) -> String {
+    if v < 0.05 {
+        "0".into()
+    } else if v < 10.0 {
+        format!("{v:.1}")
+    } else if v < 1000.0 {
+        format!("{v:.0}")
+    } else if v < 10_000.0 {
+        format!("{:.1}k", v / 1000.0)
+    } else if v < 1_000_000.0 {
+        format!("{:.0}k", v / 1000.0)
+    } else {
+        format!("{:.0}M", v / 1_000_000.0)
+    }
 }
 
 /// VRAM bar: weights ▏ KV filled ▏ KV reserved ▏ other ▏ free, with a pulsing head.
@@ -1731,6 +2334,31 @@ mod tests {
         // Half-height sample fills only the bottom row.
         assert_eq!(rows[0][3].content, " ");
         assert_eq!(rows[1][3].content, "█");
+    }
+
+    #[test]
+    fn vertical_meter_fills_from_the_foot() {
+        let rows = vmeter(0.5, 0.9, 4, 2);
+        assert_eq!(rows.len(), 4);
+        // Bottom two rows lit, top two dark, hold line in the top cell.
+        assert_eq!(rows[3][0].content, "██");
+        assert_eq!(rows[2][0].content, "██");
+        assert_eq!(rows[1][0].content, "  ");
+        assert_eq!(rows[0][0].content, "▔▔");
+        assert_eq!(rows[0][0].style.fg, Some(pal::c(pal::WHITE)));
+        // Partial: 0.3 of 4 rows = 9.6 eighths → one full cell + ▂.
+        let rows = vmeter(0.3, 0.0, 4, 1);
+        assert_eq!(rows[3][0].content, "█");
+        assert_eq!(rows[2][0].content, "▂");
+        assert_eq!(fmt_compact(0.0), "0");
+        assert_eq!(fmt_compact(4.26), "4.3");
+        assert_eq!(fmt_compact(128.4), "128");
+        assert_eq!(fmt_compact(1340.0), "1.3k");
+        assert_eq!(fmt_compact(15_760.0), "16k");
+        let fitted = fit_spans(&[Span::raw("G1 "), Span::raw("x16 g3 15.8G/s")], 10);
+        let txt: String = fitted.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(txt, "G1 x16 g3…");
+        assert_eq!(fit_spans(&[Span::raw("short")], 10).len(), 1);
     }
 
     #[test]

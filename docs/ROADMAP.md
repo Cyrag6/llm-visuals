@@ -11,6 +11,8 @@ is put together.
 - Context bar, MTP acceptance panel (`/metrics`), layer tiles, expert heat map.
 - Real router choices via a llama-server patch (`patches/`, `GET /experts`).
 - Truecolor with automatic 256-colour fallback; `--demo` runs without hardware.
+- Memory pipeline view (`b`): disk, RAM, PCIe, VRAM, prefill and decode VU
+  meters with a bottleneck verdict; bytes per step from the GGUF tensor table.
 
 ## Ideas not yet done
 
@@ -18,3 +20,8 @@ is put together.
   does not export them).
 - Show the /experts 256-token histogram as a load-balance view per layer.
 - Ollama / vLLM metrics endpoints for throughput on non-llama.cpp servers.
+- Real DRAM bandwidth (perf uncore counters) instead of the bytes × steps
+  estimate; per-GPU memory bandwidth ceilings so the VRAM meter can show GB/s
+  against the card's peak.
+- Honour `-ot` / `--override-tensor` and `--fit` output to place tensors on
+  CPU vs GPU exactly instead of by `--tensor-split` share.

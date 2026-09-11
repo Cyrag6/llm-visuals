@@ -1,5 +1,7 @@
+mod bandwidth;
 mod colors;
 mod config;
+mod host;
 mod demo;
 mod fade;
 mod gguf;
@@ -21,6 +23,7 @@ use crossterm::{
 use fade::{FadeSample, FadeState};
 use gguf::layer_device;
 use gpu::{GpuMonitor, GpuSample, GpuStats};
+use host::{HostMonitor, HostSample};
 use model_detect::DetectedModel;
 use observe::{ExpertStats, LiveStats, SpecMetrics};
 use perf::PerfTracker;
@@ -104,17 +107,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (live_tx, mut live_rx) = mpsc::channel::<LiveStats>(64);
     let (spec_tx, mut spec_rx) = mpsc::channel::<SpecMetrics>(64);
     let (experts_tx, mut experts_rx) = mpsc::channel::<ExpertStats>(16);
+    let (host_tx, mut host_rx) = mpsc::channel::<HostSample>(64);
     let (port_tx, mut port_rx) =
         tokio::sync::watch::channel(detected_model.as_ref().and_then(|d| d.port));
+    let (pid_tx, pid_rx) = tokio::sync::watch::channel(detected_model.as_ref().map(|d| d.pid));
     let gpu_filter = args.gpu_indices();
     let poll = Duration::from_millis(args.poll_ms.max(50));
 
     if args.demo {
         let n = if gpu_filter.is_empty() { 2 } else { gpu_filter.len().max(1) };
-        demo::spawn(live_tx, gpu_tx, spec_tx, experts_tx, n, DEMO_CTX);
+        demo::spawn(live_tx, gpu_tx, spec_tx, experts_tx, host_tx, n, DEMO_CTX);
     } else {
         tokio::spawn(async move {
             GpuMonitor::new().run(gpu_tx, gpu_filter).await;
+        });
+        tokio::spawn(async move {
+            // Two nvidia-smi calls per poll would be heavy; host counters at half rate is plenty.
+            HostMonitor::new(poll.max(Duration::from_millis(400))).run(host_tx, pid_rx).await;
         });
         tokio::spawn(async move {
             let mut port = *port_rx.borrow();
@@ -186,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut experts_seen: u64 = 0;
     let mut fade = FadeState::new();
     let mut view_mode = ViewMode::All;
+    let mut last_frame = Instant::now();
     let mut running = true;
     let mut done = false;
     let mut status = if args.demo {
@@ -207,10 +217,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('p') => view_mode = ViewMode::Perf,
                         KeyCode::Char('h') => view_mode = ViewMode::Heatmap,
                         KeyCode::Char('m') => view_mode = ViewMode::MoE,
+                        KeyCode::Char('b') => view_mode = ViewMode::Bandwidth,
                         KeyCode::Char('r') if !args.demo => {
                             let found = model_detect::detect_models();
                             detected_model = found.first().cloned();
                             let _ = port_tx.send(detected_model.as_ref().and_then(|d| d.port));
+                            let _ = pid_tx.send(detected_model.as_ref().map(|d| d.pid));
                             if let Some(d) = &detected_model {
                                 num_layers = d.n_layers();
                                 num_heads = d.n_heads();
@@ -266,6 +278,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(m) = spec_rx.try_recv() {
             perf.observe_spec(&m, now);
         }
+        while let Ok(h) = host_rx.try_recv() {
+            perf.observe_host(&h, now);
+        }
         while let Ok(s) = live_rx.try_recv() {
             if s.ctx_max > 0 {
                 ctx_max = s.ctx_max;
@@ -312,6 +327,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if live.ctx_max == 0 {
             live.ctx_max = ctx_max;
         }
+        let frame_dt = (now - last_frame).as_secs_f32().clamp(0.0, 1.0);
+        last_frame = now;
+        let layout = bandwidth::weight_layout(detected_model.as_ref(), &latest_gpu);
+        perf.tick_bandwidth(&layout, now, frame_dt);
         let mut sample = fade_sample_from_live(detected_model.as_ref(), &latest_gpu, &live, fade::KV_BUCKETS);
         sample.routing = routing;
         fade.tick(&sample);

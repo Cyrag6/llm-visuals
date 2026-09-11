@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::gpu::GpuStats;
+use crate::host::HostSample;
 use crate::observe::{LiveStats, SpecMetrics};
 
 pub const HISTORY: usize = 240;
@@ -159,6 +160,8 @@ pub struct PerfTracker {
     pub poll_ok: bool,
     /// Speculative decoding (MTP / draft) — only when `/metrics` is served.
     pub spec: SpecStats,
+    /// Memory pipeline meters (`b` view).
+    pub bw: BandwidthStats,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +243,225 @@ impl SpecStats {
     }
 }
 
+/// One VU-style channel: current value, a held peak that sits then falls,
+/// the session maximum for auto-scaling, and a history ring.
+#[derive(Debug, Clone)]
+pub struct Meter {
+    pub value: f32,
+    pub hold: f32,
+    hold_at: Instant,
+    pub max_seen: f32,
+    floor: f32,
+    /// Fixed full scale (e.g. 100 for a percentage, a PCIe link cap); None = auto.
+    pub full_scale: Option<f32>,
+    pub hist: VecDeque<f32>,
+}
+
+impl Meter {
+    pub fn auto(floor: f32) -> Self {
+        Self::new(floor, None)
+    }
+
+    pub fn fixed(full_scale: f32) -> Self {
+        Self::new(full_scale, Some(full_scale))
+    }
+
+    fn new(floor: f32, full_scale: Option<f32>) -> Self {
+        Self {
+            value: 0.0,
+            hold: 0.0,
+            hold_at: Instant::now(),
+            max_seen: 0.0,
+            floor,
+            full_scale,
+            hist: VecDeque::with_capacity(HISTORY),
+        }
+    }
+
+    pub fn update(&mut self, v: f32, now: Instant, dt: f32) {
+        let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+        let v = match self.full_scale {
+            Some(fs) => v.min(fs),
+            None => v,
+        };
+        self.value = v;
+        self.max_seen = self.max_seen.max(v);
+        // Hold 1.2 s, then fall at 40 % of full scale per second.
+        if v >= self.hold {
+            self.hold = v;
+            self.hold_at = now;
+        } else if (now - self.hold_at).as_secs_f32() > 1.2 {
+            self.hold = (self.hold - 0.4 * self.scale() * dt).max(v);
+        }
+        push(&mut self.hist, v);
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.full_scale.unwrap_or_else(|| self.max_seen.max(self.floor))
+    }
+
+    pub fn frac(&self) -> f32 {
+        (self.value / self.scale().max(1e-6)).clamp(0.0, 1.0)
+    }
+
+    pub fn hold_frac(&self) -> f32 {
+        (self.hold / self.scale().max(1e-6)).clamp(0.0, 1.0)
+    }
+}
+
+/// Rates along the weight path: disk → RAM → PCIe → VRAM → prefill → decode.
+/// Disk and PCIe come from host counters, the RAM and VRAM weight streams
+/// are `bytes per step × steps per second` from the GGUF tensor table.
+#[derive(Debug, Clone)]
+pub struct BandwidthStats {
+    last_host: Option<(Instant, HostSample)>,
+    pub host: HostSample,
+    pub host_seen: bool,
+    /// System-wide disk reads, MB/s.
+    pub disk: Meter,
+    /// The inference process's own storage reads, MB/s.
+    pub proc_disk_mb_s: f32,
+    pub majflt_per_s: f32,
+    /// Estimated CPU-side weight stream out of system RAM, GB/s.
+    pub ram: Meter,
+    /// PCIe host→device per GPU index, MB/s; scale is the link cap when known.
+    pub pcie_rx: Vec<Meter>,
+    pub pcie_tx: Vec<f32>,
+    /// nvidia-smi memory-controller busy %, per GPU index.
+    pub vram_busy: Vec<Meter>,
+    /// Estimated weight stream out of VRAM across all GPUs, GB/s.
+    pub vram: Meter,
+    pub prefill: Meter,
+    pub decode: Meter,
+    /// Latest weight layout the estimates were made from.
+    pub layout: WeightLayout,
+    /// Weight reads per second: verification steps/s under speculative
+    /// decoding, tokens/s otherwise, tokens/ubatch during prefill.
+    pub steps_per_s: f32,
+}
+
+/// Where the model's bytes sit, from the GGUF tensor table plus VRAM use.
+#[derive(Debug, Clone, Default)]
+pub struct WeightLayout {
+    pub known: bool,
+    pub total_bytes: u64,
+    /// Bytes touched per weight read (MoE: routed experts only, no embedding).
+    pub active_bytes: u64,
+    /// Weights that did not fit in VRAM (estimate: file size minus per-GPU
+    /// weight share), read from system RAM by the CPU every step.
+    pub cpu_bytes: u64,
+    /// llama.cpp `--ubatch-size` (weights are read once per micro-batch in prefill).
+    pub ubatch: usize,
+}
+
+impl WeightLayout {
+    pub fn active_frac(&self) -> f32 {
+        if self.total_bytes == 0 {
+            1.0
+        } else {
+            (self.active_bytes as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Bytes streamed per step from RAM and from VRAM respectively.
+    pub fn per_step(&self) -> (f32, f32) {
+        let cpu_active = self.cpu_bytes as f32 * self.active_frac();
+        let vram_active = (self.active_bytes as f32 - cpu_active).max(0.0);
+        (cpu_active, vram_active)
+    }
+}
+
+impl BandwidthStats {
+    fn new() -> Self {
+        Self {
+            last_host: None,
+            host: HostSample::default(),
+            host_seen: false,
+            disk: Meter::auto(500.0),
+            proc_disk_mb_s: 0.0,
+            majflt_per_s: 0.0,
+            ram: Meter::auto(20.0),
+            pcie_rx: Vec::new(),
+            pcie_tx: Vec::new(),
+            vram_busy: Vec::new(),
+            vram: Meter::auto(100.0),
+            prefill: Meter::auto(100.0),
+            decode: Meter::auto(10.0),
+            layout: WeightLayout::default(),
+            steps_per_s: 0.0,
+        }
+    }
+
+    fn ensure_gpu(&mut self, n: usize, gpus: &[GpuStats]) {
+        while self.pcie_rx.len() < n {
+            self.pcie_rx.push(Meter::auto(1000.0));
+            self.pcie_tx.push(0.0);
+            self.vram_busy.push(Meter::fixed(100.0));
+        }
+        for g in gpus {
+            let i = g.index as usize;
+            if i < self.pcie_rx.len() {
+                self.pcie_rx[i].full_scale = pcie_link_mb_s(g.pcie_gen, g.pcie_width);
+            }
+        }
+    }
+
+    fn observe_host(&mut self, s: &HostSample, now: Instant) {
+        self.host_seen = true;
+        if let Some((t0, prev)) = &self.last_host {
+            let dt = (now - *t0).as_secs_f32().max(1e-3);
+            let rate = |a: Option<u64>, b: Option<u64>| -> Option<f32> {
+                match (a, b) {
+                    (Some(a), Some(b)) => Some(a.saturating_sub(b) as f32 / dt),
+                    _ => None,
+                }
+            };
+            let disk = rate(s.disk_read_bytes, prev.disk_read_bytes).unwrap_or(0.0) / 1e6;
+            self.disk.update(disk, now, dt);
+            self.proc_disk_mb_s = rate(s.proc_read_bytes, prev.proc_read_bytes).unwrap_or(0.0) / 1e6;
+            self.majflt_per_s = rate(s.proc_majflt, prev.proc_majflt).unwrap_or(0.0);
+            let n = s.pcie_mb_s.iter().map(|(i, _, _)| *i as usize + 1).max().unwrap_or(0);
+            self.ensure_gpu(n, &[]);
+            for (i, rx, tx) in &s.pcie_mb_s {
+                let i = *i as usize;
+                // dmon occasionally prints a garbage sample (hundreds of GB/s
+                // on a gen-3 link); nothing real exceeds the link, so such a
+                // sample is dropped rather than shown as a saturated bus.
+                let cap = self.pcie_rx[i].full_scale.unwrap_or(PCIE_SANE_MB_S) * 1.05;
+                if *rx <= cap {
+                    self.pcie_rx[i].update(*rx, now, dt);
+                }
+                if *tx <= cap {
+                    self.pcie_tx[i] = *tx;
+                }
+            }
+        }
+        self.host = s.clone();
+        self.last_host = Some((now, s.clone()));
+    }
+}
+
+/// Above any link that exists today; used to reject bogus samples when the
+/// link generation is unknown.
+const PCIE_SANE_MB_S: f32 = 130_000.0;
+
+/// PCIe link ceiling in MB/s for a generation and lane count (payload rate
+/// after encoding: 0.985 GB/s per lane at gen 3, doubling per generation).
+pub fn pcie_link_mb_s(gen: u32, width: u32) -> Option<f32> {
+    if gen == 0 || width == 0 {
+        return None;
+    }
+    let per_lane = match gen {
+        1 => 250.0,
+        2 => 500.0,
+        3 => 985.0,
+        4 => 1969.0,
+        5 => 3938.0,
+        _ => 7877.0,
+    };
+    Some(per_lane * width as f32)
+}
+
 impl PerfTracker {
     pub fn new() -> Self {
         Self {
@@ -271,7 +493,38 @@ impl PerfTracker {
             samples: 0,
             poll_ok: false,
             spec: SpecStats::new(),
+            bw: BandwidthStats::new(),
         }
+    }
+
+    pub fn observe_host(&mut self, s: &HostSample, now: Instant) {
+        self.bw.observe_host(s, now);
+    }
+
+    /// Re-derive the RAM / VRAM weight streams from the current step rate.
+    /// Called once per frame with the latest weight layout.
+    pub fn tick_bandwidth(&mut self, layout: &WeightLayout, now: Instant, dt: f32) {
+        self.bw.layout = layout.clone();
+        let steps = match self.phase {
+            Phase::Decode => {
+                if self.spec.available && self.spec.steps_per_sec > 0.0 {
+                    self.spec.steps_per_sec
+                } else {
+                    self.decode_tps_smooth
+                }
+            }
+            Phase::Prefill => self.prefill_tps_smooth / layout.ubatch.max(1) as f32,
+            Phase::Idle => 0.0,
+        };
+        self.bw.steps_per_s = steps;
+        let (ram_b, vram_b) = layout.per_step();
+        let (ram, vram) = if layout.known {
+            (ram_b * steps / 1e9, vram_b * steps / 1e9)
+        } else {
+            (0.0, 0.0)
+        };
+        self.bw.ram.update(ram, now, dt);
+        self.bw.vram.update(vram, now, dt);
     }
 
     pub fn observe_spec(&mut self, m: &SpecMetrics, now: Instant) {
@@ -363,6 +616,8 @@ impl PerfTracker {
         }
         self.peak_decode_tps = self.peak_decode_tps.max(self.decode_tps);
         self.peak_prefill_tps = self.peak_prefill_tps.max(self.prefill_tps);
+        self.bw.decode.update(self.decode_tps, now, dt);
+        self.bw.prefill.update(self.prefill_tps, now, dt);
         push(&mut self.decode_hist, self.decode_tps);
         push(&mut self.prefill_hist, self.prefill_tps);
         self.session_decoded += d_dec as u64;
@@ -421,8 +676,10 @@ impl PerfTracker {
             self.power_peak.push((0.0, now));
         }
         self.total_power_w = gpus.iter().map(|g| g.power_watts).sum();
+        self.bw.ensure_gpu(n, gpus);
         for g in gpus {
             let i = g.index as usize;
+            self.bw.vram_busy[i].update(g.utilization_mem, now, dt);
             push(&mut self.util_hist[i], g.utilization_gpu);
             push(&mut self.power_hist[i], g.power_watts);
             push(&mut self.temp_hist[i], g.temperature.unwrap_or(0.0));
@@ -539,6 +796,83 @@ mod tests {
         assert!((p.spec.mean_accepted - 0.625).abs() < 1e-3);
         assert!((p.spec.session_accept_rate() - 85.0 / 140.0).abs() < 1e-4);
         assert_eq!(p.spec.accept_hist.len(), 2);
+    }
+
+    #[test]
+    fn meter_holds_peak_and_autoscales() {
+        let t0 = Instant::now();
+        let mut m = Meter::auto(10.0);
+        assert_eq!(m.scale(), 10.0);
+        m.update(40.0, t0, 0.2);
+        assert_eq!(m.scale(), 40.0);
+        assert_eq!(m.frac(), 1.0);
+        m.update(4.0, t0 + Duration::from_millis(500), 0.2);
+        assert_eq!(m.hold, 40.0, "held");
+        m.update(4.0, t0 + Duration::from_millis(2000), 0.5);
+        assert!(m.hold < 40.0 && m.hold >= 4.0, "falls to {}", m.hold);
+        let f = Meter::fixed(100.0);
+        assert_eq!(f.scale(), 100.0);
+        assert_eq!(pcie_link_mb_s(3, 16), Some(985.0 * 16.0));
+        assert_eq!(pcie_link_mb_s(0, 16), None);
+    }
+
+    #[test]
+    fn host_rates_from_counter_deltas() {
+        let mut p = PerfTracker::new();
+        let t0 = Instant::now();
+        let s = |disk: u64, proc_rd: u64, flt: u64, rx: f32| HostSample {
+            disk_read_bytes: Some(disk),
+            proc_read_bytes: Some(proc_rd),
+            proc_majflt: Some(flt),
+            pcie_mb_s: vec![(0, rx, 1.0), (1, rx / 2.0, 0.0)],
+            pcie_ok: true,
+            ..Default::default()
+        };
+        p.observe_host(&s(1_000_000_000, 500_000_000, 100, 10.0), t0);
+        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 800.0), t0 + Duration::from_millis(200));
+        assert!((p.bw.disk.value - 1000.0).abs() < 1.0, "{}", p.bw.disk.value);
+        assert!((p.bw.proc_disk_mb_s - 250.0).abs() < 1.0);
+        assert!((p.bw.majflt_per_s - 250.0).abs() < 1.0);
+        assert_eq!(p.bw.pcie_rx.len(), 2);
+        assert_eq!(p.bw.pcie_rx[0].value, 800.0);
+        assert_eq!(p.bw.pcie_rx[1].value, 400.0);
+        // A garbage dmon sample is dropped: the meter keeps its last reading.
+        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 209_688.0), t0 + Duration::from_millis(400));
+        assert_eq!(p.bw.pcie_rx[0].value, 800.0);
+        assert_eq!(p.bw.pcie_rx[0].hold, 800.0);
+        p.bw.pcie_rx[0].full_scale = Some(7_880.0);
+        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 9_000.0), t0 + Duration::from_millis(600));
+        assert_eq!(p.bw.pcie_rx[0].value, 800.0, "above the link cap: dropped");
+        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 7_000.0), t0 + Duration::from_millis(800));
+        assert_eq!(p.bw.pcie_rx[0].value, 7_000.0);
+    }
+
+    #[test]
+    fn weight_streams_follow_step_rate() {
+        let mut p = PerfTracker::new();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(200);
+        p.observe(&slot(1, true, 100, 100, 0), t0);
+        p.observe(&slot(1, true, 100, 100, 10), t0 + step);
+        p.observe(&slot(1, true, 100, 100, 20), t0 + step * 2);
+        assert_eq!(p.phase, Phase::Decode);
+        let layout = WeightLayout {
+            known: true,
+            total_bytes: 20_000_000_000,
+            active_bytes: 2_500_000_000,
+            cpu_bytes: 8_000_000_000,
+            ubatch: 512,
+        };
+        // 8 GB on the CPU side × 12.5 % active = 1 GB per step from RAM,
+        // the other 1.5 GB per step from VRAM.
+        let (ram_b, vram_b) = layout.per_step();
+        assert!((ram_b - 1.0e9).abs() < 1.0);
+        assert!((vram_b - 1.5e9).abs() < 1.0);
+        p.tick_bandwidth(&layout, t0 + step * 2, 0.2);
+        let steps = p.bw.steps_per_s;
+        assert!(steps > 0.0);
+        assert!((p.bw.ram.value - steps).abs() < 1e-3, "ram {} steps {}", p.bw.ram.value, steps);
+        assert!((p.bw.vram.value - 1.5 * steps).abs() < 1e-3);
     }
 
     #[test]

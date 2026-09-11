@@ -110,6 +110,44 @@ the mean number of distinct experts each layer touched over its last 256
 tokens). Without the patch the title reads `simulated`: the timing is real
 (each new token re-routes every layer) but the identities are a stand-in.
 
+### Memory pipeline
+
+Press `b` for the bandwidth view: six VU-style channel strips, one per hop
+the weights take on the way to a token, with an arrow animating between the
+stages that are moving data and a verdict line naming the hop that is
+holding the model back.
+
+![bandwidth view](docs/bandwidth.svg)
+
+<sub>Bandwidth view (`b`): a dense 27B Q6 that leaves ~4.7 GB on the CPU.
+GPUs under 40 % busy, memory controllers well under a quarter, and the
+verdict names RAM as the bound at 2.5 tok/s.</sub>
+
+| Stage | Meter | Source |
+|---|---|---|
+| DISK | MB/s read from every whole block device | `/proc/diskstats`, plus the server's own reads and major page faults from `/proc/<pid>/io` and `/proc/<pid>/stat` |
+| RAM | GB/s of weights the CPU streams out of system RAM, *estimate* | CPU-side bytes × active fraction × steps/s; CPU-side bytes = GGUF size minus what the cards hold |
+| PCIe | host→device MB/s per GPU, scaled to the link (gen × lanes) | `nvidia-smi dmon -s t` |
+| VRAM | memory-controller busy % per GPU, plus the estimated GB/s of weights streamed | `nvidia-smi utilization.memory`; bytes per step from the GGUF tensor table |
+| PREFILL | prompt tokens/s | `/slots` |
+| DECODE | generated tokens/s | `/slots` |
+
+"Bytes per step" is read straight from the GGUF tensor table: every tensor
+except the embedding lookup, with `ffn_*_exps` tensors scaled by
+`expert_used_count / expert_count`, so a 35B-A3B MoE reads ~2.7 GB per token
+while a dense 27B Q6 reads ~24 GB. A step is one verification pass under
+MTP / speculative decoding (from `/metrics`), one token otherwise, and one
+micro-batch (`-ub`, default 512) during prefill. The verdict is a rule
+chain: disk activity beats everything (weights are paging), then a PCIe link
+past a third of its cap, then a memory controller past 75 %, then CPU-side
+layers with an idle GPU, then a busy GPU (compute bound); otherwise no hop is
+saturated and the gap is latency between tokens.
+
+On a 27B Q6 model that does not quite fit two cards (~4.7 GB left on the
+CPU), the view shows the GPUs under 40 % busy, memory controllers at 24 %,
+and flags RAM as the bound at under 3 tok/s, which is what a CPU-offloaded
+layer set feels like.
+
 ### Requests
 
 One row per server task: prompt, cached and generated tokens, average prefill
@@ -125,6 +163,7 @@ and decode rates, time to first token and duration. The live request pulses.
 | `p` | performance zoom: tall sparklines, longer request log |
 | `h` | layer tiles zoom |
 | `m` | expert map zoom, finer blocks |
+| `b` | memory pipeline: disk → RAM → PCIe → VRAM → prefill → decode VU meters and the bottleneck verdict |
 | `t` | cycle theme: defrag, neon, fire, ocean, monochrome |
 | `r` | rescan for a running server |
 | `q` / `Esc` | quit |
@@ -153,6 +192,11 @@ temperature before the gauge shrinks. Truecolor is auto-detected with a
 | layer activity | utilisation of the GPU the layer lives on, smoothed |
 | expert blocks | real top-k routing from `GET /experts` (patched server), else a deterministic stand-in keyed by layer and token step |
 | MTP acceptance, tok/step, steps/s | deltas of `spec_decode_num_draft_tokens_total`, `…accepted_tokens_total`, `…drafts_total` from `GET /metrics`, 1.5 s window |
+| disk MB/s, faults/s | deltas of sectors read in `/proc/diskstats` (whole disks), `read_bytes` in `/proc/<pid>/io`, `majflt` in `/proc/<pid>/stat` |
+| resident weights | `RssFile` in `/proc/<pid>/status` |
+| PCIe MB/s | `nvidia-smi dmon -s t -c 1` rx/tx per GPU; samples above the link cap are dropped (dmon emits the odd garbage row) |
+| VRAM busy % | `utilization.memory` from `nvidia-smi` (memory-controller busy time) |
+| bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps), expert tensors × used/total, split CPU vs GPU by what the cards hold, × steps/s |
 
 Per-request `timings` only appear inside completion responses, which the
 dashboard never sees, so everything is reconstructed from polled counters.
@@ -229,6 +273,15 @@ nothing to route.
 **Colours look flat.** Your terminal did not advertise truecolor. Run with
 `--color truecolor`, or export `COLORTERM=truecolor`.
 
+**PCIe strip says "nvidia-smi dmon unavailable".** The driver does not
+report PCIe counters for this card, or `dmon` failed three times in a row;
+the other stages still work. Press `r` to retry.
+
+**RAM strip says "no tensor table".** The model path on the server's command
+line could not be opened as a GGUF (ollama blobs, remote paths, or a
+non-GGUF engine). Disk, PCIe and VRAM meters still work; the byte estimates
+need the file.
+
 **Throughput reads zero while the model is clearly working.** Another client
 may be using a different slot; the dashboard follows the busy slot when there
 is one. Check `GET /slots` on the server.
@@ -238,8 +291,8 @@ is one. Check `GET /slots` on the server.
 ## How it works
 
 `docs/ARCHITECTURE.md` has the module map and data contracts. In short:
-pollers on tokio tasks read `/slots`, `/metrics`, `/experts` and `nvidia-smi`
-every 200 ms into channels; the frame loop drains them into a `PerfTracker`
+pollers on tokio tasks read `/slots`, `/metrics`, `/experts`, `nvidia-smi`
+and the host's `/proc` counters every 200 ms into channels; the frame loop drains them into a `PerfTracker`
 (sliding-window rates, request lifecycle, peak hold) and a `FadeState`
 (attack/release smoothing, expert heat), then renders with ratatui at about
 30 fps. Tests cover every parser against captured real payloads.
@@ -248,7 +301,9 @@ every 200 ms into channels; the frame loop drains them into a `PerfTracker`
 src/
 ├── main.rs          event loop, pollers, key handling
 ├── render.rs        panels, gauges, sparklines, big digits
-├── perf.rs          rates, TTFT, request records, MTP stats
+├── perf.rs          rates, TTFT, request records, MTP stats, VU meters
+├── bandwidth.rs     weight layout and the bottleneck verdict
+├── host.rs          /proc disk, faults, RSS; nvidia-smi dmon PCIe
 ├── fade.rs          smoothing and expert heat
 ├── observe.rs       /slots, /metrics, /experts parsers
 ├── gpu.rs           nvidia-smi collector, demo GPUs

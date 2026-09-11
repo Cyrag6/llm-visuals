@@ -13,7 +13,12 @@ polled over HTTP or read from `nvidia-smi`, then derived and smoothed locally.
                                                             └──────┬────────┘
                 ┌──────────────┐  every 200 ms                     │ mpsc channels
  nvidia-smi ────┤ --query-gpu  ├──────────────► gpu.rs ────────────┤
-                └──────────────┘                GpuStats           ▼
+                └──────────────┘                GpuStats           │
+                ┌──────────────┐  every 400 ms                     │
+ /proc ─────────┤ diskstats    ├──────────────► host.rs ───────────┤
+ nvidia-smi ────┤ pid/io,stat  │                HostSample         │
+                │ dmon -s t    │                                   │
+                └──────────────┘                                   ▼
                                                         ┌────────────────────┐
  model_detect.rs ─ /proc + compute apps ─► DetectedModel│ main.rs event loop │
  gguf.rs ──────── GGUF header ───────────► GgufInfo     │  ~30 fps           │
@@ -39,10 +44,12 @@ polled over HTTP or read from `nvidia-smi`, then derived and smoothed locally.
 | `main.rs` | CLI parsing, terminal setup, spawning pollers, the frame loop, key handling |
 | `config.rs` | clap arguments and `ViewMode` |
 | `model_detect.rs` | finds inference processes via `nvidia-smi --query-compute-apps` and `/proc`, parses their command lines (model path, port, ctx size, tensor split, spec mode) |
-| `gguf.rs` | reads the GGUF header without loading tensors; maps layers to GPUs from `--tensor-split` |
+| `gguf.rs` | reads the GGUF header without loading tensors; maps layers to GPUs from `--tensor-split`; `read_tensor_summary` walks the tensor table and sizes each tensor from the gap to the next offset (no quant type table needed) |
 | `observe.rs` | HTTP GET with timeouts; parsers for `/slots`, `/metrics` (Prometheus text) and `/experts` |
 | `gpu.rs` | `nvidia-smi` CSV collector on a `spawn_blocking` thread; smooth random-walk demo GPUs |
-| `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers |
+| `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers; `Meter` (VU channel with peak hold and auto scale) and `BandwidthStats` for the pipeline view |
+| `host.rs` | host counters: `/proc/diskstats`, `/proc/<pid>/io`, `/proc/<pid>/stat` (major faults), `/proc/<pid>/status` (`RssFile`), `/proc/meminfo`, and PCIe rx/tx per GPU from `nvidia-smi dmon -s t -c 1` |
+| `bandwidth.rs` | `weight_layout` (bytes total / active / CPU-side from the GGUF tensor table and VRAM use) and `assess`, the rule chain that names the bottleneck stage |
 | `fade.rs` | time-based smoothing so the UI breathes: fast attack, slow release; per-expert heat that cools exponentially |
 | `demo.rs` | a synthetic server (prefill → decode → idle loop) that emits `LiveStats`, `SpecMetrics`, `ExpertStats` and GPU samples through the same channels |
 | `colors.rs` | truecolor / 256-colour gating, gradients, palette constants, themes |
@@ -68,6 +75,18 @@ routings and a 256-token histogram. See `patches/README.md`.
 Each optional endpoint is probed at start and after a rescan; after three
 failures the poller stops asking, so unpatched or older servers cost nothing.
 
+**Host counters** are cumulative, so `BandwidthStats::observe_host` takes
+deltas over the poll interval. `nvidia-smi dmon` is already a rate (MB/s
+over its own 1 s window) but occasionally prints a nonsense sample; anything
+above the PCIe link cap (`pcie_link_mb_s(gen, width)`) is dropped.
+
+**Weight streams** are estimates, labelled as such on screen:
+`bytes_per_step = total − embedding − experts × (1 − used/total)`;
+`cpu_bytes = file − Σ min(file × split share, VRAM used)`; RAM GB/s =
+`cpu_bytes × active fraction × steps/s`, VRAM GB/s = the rest. Steps/s is
+`spec.steps_per_sec` when `/metrics` is served, else decode tok/s; during
+prefill it is `prefill tok/s ÷ ubatch`.
+
 ## Timing model
 
 - Pollers run on their own tasks and push into bounded channels.
@@ -89,6 +108,9 @@ failures the poller stops asking, so unpatched or older servers cost nothing.
   border title is attached only if it cannot collide with the left one
   (`with_right`); otherwise the information moves into the body or is shed.
 - Gauges have half-cell precision and an optional white peak-hold notch.
+  The pipeline view's vertical meters (`vmeter`) use eighth-block precision,
+  green at the foot to red at the top, with a `▔` peak line that holds 1.2 s
+  and then falls at 40 % of scale per second.
 - Sparklines are right-aligned in time (newest at the right edge) and coloured
   by level with a gradient.
 - Layout sheds panels below 26 rows (requests) and 20 rows (context/MTP); the

@@ -21,6 +21,8 @@ pub struct DetectedModel {
     pub tensor_split: Vec<f32>,
     pub cmdline: String,
     pub gguf: Option<GgufInfo>,
+    /// Weight byte layout from the tensor table (for bandwidth estimates).
+    pub tensors: Option<gguf::TensorSummary>,
 }
 
 impl std::fmt::Display for DetectedModel {
@@ -86,6 +88,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
             tensor_split: parsed.tensor_split.clone(),
             cmdline: cmdline.clone(),
             gguf: None,
+            tensors: None,
         });
         if !entry.gpu_indices.contains(&app.gpu_index) {
             entry.gpu_indices.push(app.gpu_index);
@@ -116,6 +119,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
                 tensor_split: parsed.tensor_split,
                 cmdline,
                 gguf: None,
+            tensors: None,
             },
         );
     }
@@ -129,6 +133,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
                         m.name = info.name.clone();
                     }
                     m.gguf = Some(info);
+                    m.tensors = gguf::read_tensor_summary(&path).ok();
                 }
             }
         }

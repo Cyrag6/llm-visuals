@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::gguf::GgufInfo;
 use crate::gpu::{DemoGpu, GpuSample, GpuStats};
+use crate::host::HostSample;
 use crate::model_detect::DetectedModel;
 use crate::observe::{ExpertLayer, ExpertStats, LiveStats, SpecMetrics};
 
@@ -37,6 +38,14 @@ pub fn demo_model(ctx_max: usize) -> DetectedModel {
             n_embd: 2048,
             n_mtp: 1,
         }),
+        // Shaped like a real Q4 35B-A3B file: most bytes are expert tensors.
+        tensors: Some(crate::gguf::TensorSummary {
+            total_bytes: 19_800_000_000,
+            expert_bytes: 17_100_000_000,
+            embd_bytes: 540_000_000,
+            block_bytes: vec![19_800_000_000 / 41; 41],
+            n_tensors: 753,
+        }),
     }
 }
 
@@ -51,6 +60,7 @@ pub fn spawn(
     gpu_tx: mpsc::Sender<GpuSample>,
     spec_tx: mpsc::Sender<SpecMetrics>,
     experts_tx: mpsc::Sender<ExpertStats>,
+    host_tx: mpsc::Sender<HostSample>,
     num_gpus: usize,
     ctx_max: usize,
 ) {
@@ -64,6 +74,14 @@ pub fn spawn(
         let model = demo_model(ctx_max);
         let gg = model.gguf.as_ref().unwrap();
         let mut experts = DemoExperts::new(gg.n_layers, gg.n_experts, gg.n_experts_used);
+        let mut host = DemoHost::new(num_gpus.max(1));
+        let mut tx = Emitters {
+            live_tx,
+            gpu_tx,
+            spec_tx,
+            experts_tx,
+            host_tx,
+        };
         let mut stats = LiveStats {
             ctx_max,
             spec_types: "none,draft-mtp".into(),
@@ -78,7 +96,7 @@ pub fn spawn(
             stats.prompt_processed = 0;
             stats.slots_busy = 0;
             for _ in 0..idle_ticks {
-                if emit(&live_tx, &gpu_tx, &spec_tx, &experts_tx, &stats, &spec, &mut experts, &mut gpus, 0.02).await.is_err() {
+                if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, 0.02).await.is_err() {
                     return;
                 }
                 tokio::time::sleep(tick).await;
@@ -93,6 +111,9 @@ pub fn spawn(
                 0
             };
             let prefill_tps = 700.0 + next_f(&mut seed) * 900.0;
+            // One request in four finds part of the model evicted from the
+            // page cache, so the disk meter has something real to show.
+            host.cold_ticks = if next_f(&mut seed) < 0.25 { 3 } else { 0 };
             stats.id_task = id_task;
             stats.processing = true;
             stats.slots_busy = 1;
@@ -105,7 +126,7 @@ pub fn spawn(
                 let before = stats.prompt_processed;
                 stats.prompt_processed = (stats.prompt_processed + step.max(1)).min(prompt);
                 experts.route(stats.prompt_processed - before, &mut seed);
-                if emit(&live_tx, &gpu_tx, &spec_tx, &experts_tx, &stats, &spec, &mut experts, &mut gpus, 0.95).await.is_err() {
+                if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, 0.95).await.is_err() {
                     return;
                 }
                 tokio::time::sleep(tick).await;
@@ -134,7 +155,7 @@ pub fn spawn(
                 spec.n_decode += steps;
                 spec.tokens_predicted += step as u64;
                 let load = 0.55 + 0.35 * (tps / (base_tps * 1.3)).clamp(0.0, 1.0);
-                if emit(&live_tx, &gpu_tx, &spec_tx, &experts_tx, &stats, &spec, &mut experts, &mut gpus, load).await.is_err() {
+                if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, load).await.is_err() {
                     return;
                 }
                 tokio::time::sleep(tick).await;
@@ -143,7 +164,7 @@ pub fn spawn(
             stats.processing = false;
             stats.prompt_processed = 0;
             stats.slots_busy = 0;
-            if emit(&live_tx, &gpu_tx, &spec_tx, &experts_tx, &stats, &spec, &mut experts, &mut gpus, 0.2).await.is_err() {
+            if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, 0.2).await.is_err() {
                 return;
             }
             tokio::time::sleep(tick).await;
@@ -221,20 +242,91 @@ impl DemoExperts {
     }
 }
 
+struct Emitters {
+    live_tx: mpsc::Sender<LiveStats>,
+    gpu_tx: mpsc::Sender<GpuSample>,
+    spec_tx: mpsc::Sender<SpecMetrics>,
+    experts_tx: mpsc::Sender<ExpertStats>,
+    host_tx: mpsc::Sender<HostSample>,
+}
+
+/// Host counters for the demo: a page-cache miss burst on cold requests,
+/// PCIe traffic proportional to load (the second card holds offloaded
+/// layers so it sees more), and a fixed resident set.
+struct DemoHost {
+    n_gpus: usize,
+    seed: u64,
+    disk_bytes: u64,
+    proc_bytes: u64,
+    majflt: u64,
+    cold_ticks: u32,
+}
+
+impl DemoHost {
+    fn new(n_gpus: usize) -> Self {
+        Self {
+            n_gpus,
+            seed: 0xD1CE_5EED,
+            disk_bytes: 40_000_000_000,
+            proc_bytes: 2_000_000_000,
+            majflt: 1200,
+            cold_ticks: 0,
+        }
+    }
+
+    fn step(&mut self, load: f32, processing: bool) -> HostSample {
+        let jitter = next_f(&mut self.seed);
+        if self.cold_ticks > 0 {
+            self.cold_ticks -= 1;
+            // 0.2 s at ~1.4 GB/s.
+            let burst = (240_000_000.0 + 80_000_000.0 * jitter) as u64;
+            self.disk_bytes += burst;
+            self.proc_bytes += burst;
+            self.majflt += 1500 + (jitter * 400.0) as u64;
+        } else {
+            self.disk_bytes += (jitter * 400_000.0) as u64;
+        }
+        let pcie_mb_s = (0..self.n_gpus)
+            .map(|i| {
+                let base = if !processing {
+                    2.0
+                } else if i == 1 {
+                    180.0 + 900.0 * load
+                } else {
+                    40.0 + 120.0 * load
+                };
+                let rx = base * (0.85 + 0.3 * next_f(&mut self.seed));
+                (i as u32, rx, rx * 0.12)
+            })
+            .collect();
+        HostSample {
+            disk_read_bytes: Some(self.disk_bytes),
+            proc_read_bytes: Some(self.proc_bytes),
+            proc_majflt: Some(self.majflt),
+            rss_file_bytes: Some(6_100_000_000),
+            rss_bytes: Some(7_300_000_000),
+            mem_total_bytes: Some(64_000_000_000),
+            mem_available_bytes: Some(41_000_000_000),
+            page_cache_bytes: Some(22_000_000_000),
+            pcie_mb_s,
+            pcie_ok: true,
+        }
+    }
+}
+
 async fn emit(
-    live_tx: &mpsc::Sender<LiveStats>,
-    gpu_tx: &mpsc::Sender<GpuSample>,
-    spec_tx: &mpsc::Sender<SpecMetrics>,
-    experts_tx: &mpsc::Sender<ExpertStats>,
+    tx: &mut Emitters,
     stats: &LiveStats,
     spec: &SpecMetrics,
     experts: &mut DemoExperts,
     gpus: &mut [DemoGpu],
+    host: &mut DemoHost,
     load: f32,
 ) -> Result<(), ()> {
     let g: Vec<GpuStats> = gpus.iter_mut().map(|d| d.step(load)).collect();
-    gpu_tx.send(Ok(g)).await.map_err(|_| ())?;
-    spec_tx.send(spec.clone()).await.map_err(|_| ())?;
-    experts_tx.send(experts.stats.clone()).await.map_err(|_| ())?;
-    live_tx.send(stats.clone()).await.map_err(|_| ())
+    tx.gpu_tx.send(Ok(g)).await.map_err(|_| ())?;
+    tx.spec_tx.send(spec.clone()).await.map_err(|_| ())?;
+    tx.experts_tx.send(experts.stats.clone()).await.map_err(|_| ())?;
+    tx.host_tx.send(host.step(load, stats.processing)).await.map_err(|_| ())?;
+    tx.live_tx.send(stats.clone()).await.map_err(|_| ())
 }

@@ -90,6 +90,113 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
     })
 }
 
+/// Where the bytes of a GGUF live: total, expert (MoE) tensors, the token
+/// embedding table, and per-block totals. Sizes come from the gap between
+/// consecutive tensor offsets, so no quantisation type table is needed.
+#[derive(Debug, Clone, Default)]
+pub struct TensorSummary {
+    pub total_bytes: u64,
+    /// `ffn_*_exps` tensors: only `n_experts_used / n_experts` of these are
+    /// touched per token.
+    pub expert_bytes: u64,
+    /// `token_embd`: a row lookup, not a matmul, so it is not streamed per token.
+    pub embd_bytes: u64,
+    /// Bytes per transformer block (`blk.N.*`), indexed by N.
+    pub block_bytes: Vec<u64>,
+    pub n_tensors: usize,
+}
+
+impl TensorSummary {
+    /// Weight bytes read to produce one token (or one verification step of a
+    /// speculative decoder): everything except the embedding lookup, with the
+    /// expert tensors scaled by the routed fraction.
+    pub fn active_bytes_per_token(&self, n_experts: usize, n_experts_used: usize) -> u64 {
+        let dense = self.total_bytes.saturating_sub(self.expert_bytes).saturating_sub(self.embd_bytes);
+        let experts = if n_experts > 0 && n_experts_used > 0 && n_experts_used < n_experts {
+            (self.expert_bytes as f64 * n_experts_used as f64 / n_experts as f64) as u64
+        } else {
+            self.expert_bytes
+        };
+        dense + experts
+    }
+}
+
+/// Walk the whole header (including tokenizer arrays) to reach the tensor
+/// info table. Takes ~100 ms on a 25 GB file; call it once per detection.
+pub fn read_tensor_summary(path: &Path) -> Result<TensorSummary, String> {
+    let file_len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let mut f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != b"GGUF" {
+        return Err("not a GGUF file".into());
+    }
+    let version = read_u32(&mut f)?;
+    if version < 2 {
+        return Err(format!("unsupported GGUF version {version}"));
+    }
+    let n_tensors = read_u64(&mut f)? as usize;
+    let n_kv = read_u64(&mut f)? as usize;
+    let mut alignment: u64 = 32;
+    for _ in 0..n_kv {
+        let key = read_string(&mut f)?;
+        let ty = read_u32(&mut f)?;
+        let val = read_value(&mut f, ty)?;
+        if key == "general.alignment" {
+            if let Val::U(a) = val {
+                if a > 0 {
+                    alignment = a;
+                }
+            }
+        }
+    }
+    let mut tensors: Vec<(String, u64)> = Vec::with_capacity(n_tensors.min(4096));
+    for _ in 0..n_tensors {
+        let name = read_string(&mut f)?;
+        let n_dims = read_u32(&mut f)?;
+        if n_dims > 8 {
+            return Err("bad tensor dimension count".into());
+        }
+        for _ in 0..n_dims {
+            let _ = read_u64(&mut f)?;
+        }
+        let _ty = read_u32(&mut f)?;
+        let offset = read_u64(&mut f)?;
+        tensors.push((name, offset));
+    }
+    let header_end = f.stream_position().map_err(|e| e.to_string())?;
+    let data_start = (header_end + alignment - 1) / alignment * alignment;
+    let data_len = file_len.saturating_sub(data_start);
+    tensors.sort_by_key(|(_, off)| *off);
+    let mut out = TensorSummary {
+        n_tensors: tensors.len(),
+        ..Default::default()
+    };
+    for i in 0..tensors.len() {
+        let (name, off) = &tensors[i];
+        let next = tensors.get(i + 1).map(|(_, o)| *o).unwrap_or(data_len);
+        let size = next.saturating_sub(*off);
+        out.total_bytes += size;
+        if name.contains("_exps") {
+            out.expert_bytes += size;
+        }
+        if name.starts_with("token_embd") {
+            out.embd_bytes += size;
+        }
+        if let Some(rest) = name.strip_prefix("blk.") {
+            if let Some(n) = rest.split('.').next().and_then(|n| n.parse::<usize>().ok()) {
+                if n < 4096 {
+                    if out.block_bytes.len() <= n {
+                        out.block_bytes.resize(n + 1, 0);
+                    }
+                    out.block_bytes[n] += size;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone)]
 enum Val {
     U(u64),
@@ -241,5 +348,28 @@ mod tests {
         assert!(info.n_layers > 0);
         assert!(info.n_heads > 0);
         assert!(!info.architecture.is_empty());
+        let t = read_tensor_summary(path).expect("tensor table");
+        let file_len = std::fs::metadata(path).unwrap().len();
+        // Every byte of the data section belongs to some tensor.
+        assert!(t.total_bytes > file_len / 2 && t.total_bytes <= file_len);
+        // block_count may or may not include the MTP/nextn blocks.
+        assert!(t.block_bytes.len() >= info.n_layers && t.block_bytes.len() <= info.n_layers + info.n_mtp + 1);
+        if info.is_moe() {
+            assert!(t.expert_bytes > t.total_bytes / 2);
+        }
+        assert!(t.active_bytes_per_token(info.n_experts, info.n_experts_used) < t.total_bytes);
+    }
+
+    #[test]
+    fn active_bytes_scales_experts_only() {
+        let t = TensorSummary {
+            total_bytes: 1000,
+            expert_bytes: 800,
+            embd_bytes: 50,
+            block_bytes: vec![],
+            n_tensors: 3,
+        };
+        assert_eq!(t.active_bytes_per_token(0, 0), 950);
+        assert_eq!(t.active_bytes_per_token(256, 8), 150 + 25);
     }
 }

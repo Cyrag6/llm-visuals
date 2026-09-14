@@ -2,8 +2,8 @@
 
 **A live terminal dashboard for the LLM running on your machine.**
 
-It finds the inference server you already have up (llama.cpp `llama-server`,
-ollama, vLLM, …), reads its counters and `nvidia-smi`, and turns them into a
+It finds the inference servers you already have up (llama.cpp `llama-server`,
+ollama, vLLM, …), reads their counters and `nvidia-smi`, and turns them into a
 truecolor picture of what the model is doing right now: tokens per second, time
 to first token, GPU load and memory, context fill, speculative-decoding
 acceptance, which layers are busy on which GPU, and, with a small server patch,
@@ -24,6 +24,7 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 
 - [Quick start](#quick-start)
 - [What you see](#what-you-see)
+- [Several models at once](#several-models-at-once)
 - [Keys](#keys)
 - [Where every number comes from](#where-every-number-comes-from)
 - [Server setup: metrics and real expert routing](#server-setup-metrics-and-real-expert-routing)
@@ -155,6 +156,32 @@ and decode rates, time to first token and duration. The live request pulses.
 
 ---
 
+## Several models at once
+
+Every inference server on the machine is monitored, not just the first one
+found. Each gets its own poller, its own rate windows and request log, and its
+own smoothing, so one model prefilling does not disturb another's numbers.
+
+**Shown together.** A strip under the header carries one line per model —
+phase, decode rate, recent history, context fill and VRAM — so you can see at
+a glance which one is working. The GPU panel tags each card with the models
+resident on it (`⟨1,3⟩`), since they share the box.
+
+**Shown side by side.** `v` opens the comparison view: one card per model with
+its rate, prefill, TTFT, context, acceptance, shape, VRAM and history, up to
+four across, wrapping onto more rows beyond that.
+
+**Shown one at a time.** The panels that only make sense for a single model —
+layer tiles, the expert map, the memory pipeline, the request log — follow the
+focused model. `Tab` / `Shift-Tab` move the focus, `1`–`9` jump straight to
+one, and the header says which of how many you are looking at.
+
+The strip appears only when there is more than one model, so a single-server
+setup looks exactly as it did before. `--max-models N` caps how many are
+watched and `--pid A,B` restricts it to named processes.
+
+---
+
 ## Keys
 
 | Key | Action |
@@ -164,13 +191,17 @@ and decode rates, time to first token and duration. The live request pulses.
 | `h` | layer tiles zoom |
 | `m` | expert map zoom, finer blocks |
 | `b` | memory pipeline: disk → RAM → PCIe → VRAM → prefill → decode VU meters and the bottleneck verdict |
+| `v` | compare every model side by side |
+| `Tab` / `Shift-Tab` | focus the next / previous model |
+| `1`–`9` | focus that model directly |
 | `t` | cycle theme: defrag, neon, fire, ocean, monochrome |
-| `r` | rescan for a running server |
+| `r` | rescan for running servers |
 | `q` / `Esc` | quit |
 
-Layouts adapt: below 26 rows the request log goes, below 20 the context and
-MTP row goes, and on narrow terminals the GPU line sheds PCIe, fan, clock and
-temperature before the gauge shrinks. Truecolor is auto-detected with a
+Layouts adapt: the model strip is the first thing shed on a short terminal,
+then the request log, then the context and MTP row, and on narrow terminals
+the GPU line sheds PCIe, fan, clock and temperature before the gauge shrinks,
+while the key row shortens its own labels. Truecolor is auto-detected with a
 256-colour fallback.
 
 ---
@@ -235,9 +266,12 @@ servers cost nothing.
 ## Command-line options
 
 ```
---demo               synthetic server and GPUs; exercises every panel
---model <id|auto>    `auto` (default) observes the running server;
+--demo               synthetic servers and GPUs; exercises every panel
+--demo-models N      how many synthetic servers --demo runs (default 2)
+--model <id|auto>    `auto` (default) observes the running servers;
                      an HF id streams real attention via the Python bridge
+--max-models N       most models to watch at once (default 8)
+--pid A,B            only watch these PIDs (default: every model found)
 --gpu 0,1            nvidia-smi indices to show (default: all)
 --poll-ms 200        sampling interval for the server and nvidia-smi
 --color auto|truecolor|256
@@ -253,8 +287,15 @@ servers cost nothing.
 
 **"no inference server detected".** The server must be a local process; the
 detector looks for `llama-server`, `ollama`, `vllm`, `sglang`, `exllama`,
-`text-generation` and similar names, or a `--model` flag. Start it, then press
-`r`.
+`text-generation` and similar names, or a `--model` / `-m` flag whose argument
+names a weights file, an existing directory or a HuggingFace id. (A bare
+`-m` after an interpreter is a module, not a model, so `python3 -m uvicorn`
+is not mistaken for a server.) Start it, then press `r`.
+
+**A model you are running is missing from the strip.** An engine daemon with
+nothing loaded is hidden whenever a server that is actually serving a model is
+present, and `--max-models` caps the list at 8 by default. Raise the cap, or
+name the process with `--pid`.
 
 **GPU panel says "Driver/library version mismatch".** `nvidia-smi` itself is
 failing: the NVIDIA userspace was upgraded under a running kernel module.
@@ -291,15 +332,17 @@ is one. Check `GET /slots` on the server.
 ## How it works
 
 `docs/ARCHITECTURE.md` has the module map and data contracts. In short:
-pollers on tokio tasks read `/slots`, `/metrics`, `/experts`, `nvidia-smi`
-and the host's `/proc` counters every 200 ms into channels; the frame loop drains them into a `PerfTracker`
-(sliding-window rates, request lifecycle, peak hold) and a `FadeState`
-(attack/release smoothing, expert heat), then renders with ratatui at about
-30 fps. Tests cover every parser against captured real payloads.
+one poller per model reads its `/slots`, `/metrics` and `/experts` while
+shared collectors read `nvidia-smi` and the host's `/proc` counters every
+200 ms into channels; samples are tagged with the model's PID, and the frame
+loop routes each into that model's `PerfTracker` (sliding-window rates,
+request lifecycle, peak hold) and `FadeState` (attack/release smoothing,
+expert heat), then renders with ratatui at about 30 fps. Tests cover every
+parser against captured real payloads.
 
 ```
 src/
-├── main.rs          event loop, pollers, key handling
+├── main.rs          event loop, per-model slots, pollers, key handling
 ├── render.rs        panels, gauges, sparklines, big digits
 ├── perf.rs          rates, TTFT, request records, MTP stats, VU meters
 ├── bandwidth.rs     weight layout and the bottleneck verdict
@@ -307,9 +350,9 @@ src/
 ├── fade.rs          smoothing and expert heat
 ├── observe.rs       /slots, /metrics, /experts parsers
 ├── gpu.rs           nvidia-smi collector, demo GPUs
-├── model_detect.rs  finds the server, parses its command line
+├── model_detect.rs  finds the servers, parses their command lines
 ├── gguf.rs          GGUF header reader, layer → GPU mapping
-├── demo.rs          synthetic server for --demo
+├── demo.rs          synthetic servers for --demo
 ├── colors.rs        palette, gradients, truecolor/256 gating
 └── llm/             optional HF transformers attention bridge
 patches/             llama.cpp patch for GET /experts

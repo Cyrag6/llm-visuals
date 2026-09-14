@@ -14,6 +14,8 @@ pub enum ViewMode {
     MoE,
     /// Memory pipeline: disk → RAM → PCIe → VRAM → prefill → decode meters.
     Bandwidth,
+    /// Side-by-side comparison of every detected model.
+    Models,
 }
 
 impl std::fmt::Display for ViewMode {
@@ -24,6 +26,7 @@ impl std::fmt::Display for ViewMode {
             ViewMode::Heatmap => write!(f, "layers"),
             ViewMode::MoE => write!(f, "moe"),
             ViewMode::Bandwidth => write!(f, "bandwidth"),
+            ViewMode::Models => write!(f, "models"),
         }
     }
 }
@@ -97,6 +100,18 @@ pub struct Args {
     /// Poll interval for the inference server and nvidia-smi, in ms
     #[arg(long, default_value_t = 200)]
     pub poll_ms: u64,
+
+    /// Demo: number of synthetic models to run side by side
+    #[arg(long, default_value_t = 2)]
+    pub demo_models: usize,
+
+    /// Maximum number of detected models to monitor at once
+    #[arg(long, default_value_t = 8)]
+    pub max_models: usize,
+
+    /// Only monitor these PIDs (comma-separated); default is every model found
+    #[arg(long, default_value = "all")]
+    pub pid: String,
 }
 
 impl Args {
@@ -119,6 +134,17 @@ impl Args {
     /// Whether to auto-detect the running model (explicit flag or "auto" value)
     pub fn auto_detect(&self) -> bool {
         self.detect_auto || self.model == "auto"
+    }
+
+    /// PIDs the user restricted monitoring to. Empty means every model found.
+    pub fn pid_filter(&self) -> Vec<u32> {
+        if self.pid == "all" {
+            return vec![];
+        }
+        self.pid
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
     }
 
     /// GPU indices to monitor. Empty means all devices.

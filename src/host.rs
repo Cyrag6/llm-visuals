@@ -37,18 +37,22 @@ impl HostMonitor {
         Self { interval }
     }
 
-    /// Poll until the receiver goes away. `pid_rx` follows the detected server
-    /// so a rescan retargets the per-process counters.
-    pub async fn run(self, tx: mpsc::Sender<HostSample>, mut pid_rx: watch::Receiver<Option<u32>>) {
+    /// Poll until the receiver goes away. `pids_rx` follows the detected
+    /// servers so a rescan retargets the per-process counters. One sample is
+    /// produced per PID: the system-wide fields (disk, memory, PCIe) are read
+    /// once and shared, so watching six models costs no more `nvidia-smi`
+    /// calls than watching one.
+    pub async fn run(self, tx: mpsc::Sender<Vec<(u32, HostSample)>>, mut pids_rx: watch::Receiver<Vec<u32>>) {
         let mut pcie_ok = true;
         let mut pcie_misses = 0u32;
         loop {
-            let pid = *pid_rx.borrow_and_update();
+            let pids = pids_rx.borrow_and_update().clone();
             let want_pcie = pcie_ok;
-            let sample = tokio::task::spawn_blocking(move || collect(pid, want_pcie)).await;
-            if let Ok(mut s) = sample {
+            let sample = tokio::task::spawn_blocking(move || collect(&pids, want_pcie)).await;
+            if let Ok(mut batch) = sample {
+                let got_pcie = batch.first().map(|(_, s)| s.pcie_ok).unwrap_or(false);
                 if want_pcie {
-                    if s.pcie_ok {
+                    if got_pcie {
                         pcie_misses = 0;
                     } else {
                         pcie_misses += 1;
@@ -57,13 +61,15 @@ impl HostMonitor {
                         }
                     }
                 }
-                s.pcie_ok = pcie_ok;
-                if tx.send(s).await.is_err() {
+                for (_, s) in &mut batch {
+                    s.pcie_ok = pcie_ok;
+                }
+                if tx.send(batch).await.is_err() {
                     break;
                 }
             }
             tokio::select! {
-                changed = pid_rx.changed() => {
+                changed = pids_rx.changed() => {
                     if changed.is_err() { break; }
                     pcie_ok = true;
                     pcie_misses = 0;
@@ -74,37 +80,47 @@ impl HostMonitor {
     }
 }
 
-fn collect(pid: Option<u32>, want_pcie: bool) -> HostSample {
-    let mut s = HostSample::default();
+fn collect(pids: &[u32], want_pcie: bool) -> Vec<(u32, HostSample)> {
+    let mut base = HostSample::default();
     if let Ok(txt) = std::fs::read_to_string("/proc/diskstats") {
-        s.disk_read_bytes = Some(parse_diskstats_read_bytes(&txt));
+        base.disk_read_bytes = Some(parse_diskstats_read_bytes(&txt));
     }
     if let Ok(txt) = std::fs::read_to_string("/proc/meminfo") {
         let (t, a, c) = parse_meminfo(&txt);
-        s.mem_total_bytes = t;
-        s.mem_available_bytes = a;
-        s.page_cache_bytes = c;
-    }
-    if let Some(pid) = pid {
-        let dir = format!("/proc/{pid}");
-        if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("io")) {
-            s.proc_read_bytes = parse_proc_io_read_bytes(&txt);
-        }
-        if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("stat")) {
-            s.proc_majflt = parse_proc_stat_majflt(&txt);
-        }
-        if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("status")) {
-            s.rss_file_bytes = status_kb(&txt, "RssFile:");
-            s.rss_bytes = status_kb(&txt, "VmRSS:");
-        }
+        base.mem_total_bytes = t;
+        base.mem_available_bytes = a;
+        base.page_cache_bytes = c;
     }
     if want_pcie {
         if let Some(p) = pcie_throughput() {
-            s.pcie_mb_s = p;
-            s.pcie_ok = true;
+            base.pcie_mb_s = p;
+            base.pcie_ok = true;
         }
     }
-    s
+    if pids.is_empty() {
+        return vec![(0, base)];
+    }
+    pids.iter()
+        .map(|&pid| {
+            let mut s = base.clone();
+            read_proc(pid, &mut s);
+            (pid, s)
+        })
+        .collect()
+}
+
+fn read_proc(pid: u32, s: &mut HostSample) {
+    let dir = format!("/proc/{pid}");
+    if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("io")) {
+        s.proc_read_bytes = parse_proc_io_read_bytes(&txt);
+    }
+    if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("stat")) {
+        s.proc_majflt = parse_proc_stat_majflt(&txt);
+    }
+    if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("status")) {
+        s.rss_file_bytes = status_kb(&txt, "RssFile:");
+        s.rss_bytes = status_kb(&txt, "VmRSS:");
+    }
 }
 
 /// `nvidia-smi dmon -s t -c 1` prints one row per GPU with rx/tx MB/s.

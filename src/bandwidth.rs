@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn layout_puts_the_remainder_on_the_cpu() {
-        let mut m = crate::demo::demo_model(4096);
+        let mut m = crate::demo::demo_models(4096, 1).remove(0);
         m.tensor_split = vec![];
         m.tensors = Some(crate::gguf::TensorSummary {
             total_bytes: 25_000_000_000,

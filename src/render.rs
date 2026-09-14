@@ -21,10 +21,30 @@ use crate::perf::{Meter, PerfTracker, Phase, RequestRecord};
 use crate::pipeline::{GeneratedText, TokenBuffer};
 
 const HEATMAP_TOKEN_WIDTH: usize = 40;
+/// Most model rows the strip under the header will show before it scrolls.
+const MODEL_BAR_MAX: usize = 6;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// One monitored model's live state, borrowed from its slot in the main loop.
+/// The panels that can show every model at once walk `Dashboard::models`;
+/// the ones that can only show a single model use the focused entry, which
+/// the `Dashboard` also exposes directly.
+pub struct ModelView<'a> {
+    pub detected: &'a DetectedModel,
+    pub perf: &'a PerfTracker,
+    pub live: &'a LiveStats,
+    pub fade: &'a FadeState,
+    pub experts: Option<&'a ExpertStats>,
+    pub num_layers: usize,
+    pub num_heads: usize,
+}
 
 /// Everything one frame needs, borrowed from the main loop.
 pub struct Dashboard<'a> {
+    /// Every model being monitored, in detection order.
+    pub models: &'a [ModelView<'a>],
+    /// Index into `models` of the one the single-model panels are showing.
+    pub focus: usize,
     pub detected: Option<&'a DetectedModel>,
     pub gpus: &'a [GpuStats],
     /// Why the last nvidia-smi poll produced nothing, if it failed.
@@ -90,57 +110,80 @@ impl Renderer {
     }
 
     fn render_view(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
-        if d.view == ViewMode::Bandwidth {
-            let verdict_h = if area.height >= 24 { 4 } else { 0 };
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(12),
-                    Constraint::Length(verdict_h),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-            self.render_header(frame, rows[0], d);
-            self.render_pipeline(frame, rows[1], d);
-            if rows[2].height > 0 {
-                self.render_verdict(frame, rows[2], d);
-            }
-            self.render_footer(frame, rows[3], d);
-            return;
+        // With more than one model the strip under the header carries all of
+        // them at once; it is the first thing shed on a short terminal.
+        let bar_rows = if d.models.len() > 1 {
+            d.models.len().min(MODEL_BAR_MAX) as u16 + 2
+        } else {
+            0
+        };
+        let bar_h = if bar_rows > 0 && area.height >= bar_rows + 14 {
+            bar_rows
+        } else {
+            0
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(bar_h),
+                Constraint::Min(4),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        self.render_header(frame, rows[0], d);
+        if bar_h > 0 {
+            self.render_models_bar(frame, rows[1], d);
         }
+        match d.view {
+            ViewMode::Models => self.render_compare(frame, rows[2], d),
+            ViewMode::Bandwidth => self.render_bandwidth(frame, rows[2], d),
+            _ => self.render_panels(frame, rows[2], d),
+        }
+        self.render_footer(frame, rows[3], d);
+    }
+
+    fn render_bandwidth(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let verdict_h = if area.height >= 20 { 4 } else { 0 };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(12), Constraint::Length(verdict_h)])
+            .split(area);
+        self.render_pipeline(frame, rows[0], d);
+        if rows[1].height > 0 {
+            self.render_verdict(frame, rows[1], d);
+        }
+    }
+
+    /// The dashboard proper: everything below the header, for the focused model.
+    fn render_panels(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let n_gpus = d.gpus.len();
         let h = area.height;
         let gpu_rows = (3 * n_gpus.max(1) as u16 + 2).max(9);
-        let show_requests = h >= 26;
-        let show_ctx = h >= 20;
+        let show_requests = h >= 22;
+        let show_ctx = h >= 16;
         let req_h = if show_requests { 7 } else { 0 };
         let ctx_h = if !show_ctx { 0 } else if d.view == ViewMode::Perf { 6 } else { 4 };
 
         let constraints: Vec<Constraint> = match d.view {
             ViewMode::All => vec![
-                Constraint::Length(3),
                 Constraint::Length(gpu_rows),
                 Constraint::Length(ctx_h),
                 Constraint::Min(8),
                 Constraint::Length(req_h),
-                Constraint::Length(1),
             ],
             ViewMode::Perf => vec![
-                Constraint::Length(3),
                 Constraint::Min(12),
                 Constraint::Length(ctx_h),
                 Constraint::Length(0),
                 Constraint::Length(if show_requests { 12 } else { 0 }),
-                Constraint::Length(1),
             ],
-            ViewMode::Heatmap | ViewMode::MoE | ViewMode::Bandwidth => vec![
-                Constraint::Length(3),
+            ViewMode::Heatmap | ViewMode::MoE | ViewMode::Bandwidth | ViewMode::Models => vec![
                 Constraint::Length(0),
                 Constraint::Length(ctx_h),
                 Constraint::Min(8),
                 Constraint::Length(0),
-                Constraint::Length(1),
             ],
         };
         let rows = Layout::default()
@@ -148,42 +191,39 @@ impl Renderer {
             .constraints(constraints)
             .split(area);
 
-        self.render_header(frame, rows[0], d);
-
-        if rows[1].height > 0 {
+        if rows[0].height > 0 {
             let split = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-                .split(rows[1]);
+                .split(rows[0]);
             self.render_throughput(frame, split[0], d);
             self.render_gpus(frame, split[1], d);
         }
-        if rows[2].height > 0 {
+        if rows[1].height > 0 {
             let split = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-                .split(rows[2]);
+                .split(rows[1]);
             self.render_context(frame, split[0], d);
             self.render_spec(frame, split[1], d);
         }
-        if rows[3].height > 0 {
+        if rows[2].height > 0 {
             match d.view {
-                ViewMode::Heatmap => self.render_layers(frame, rows[3], d),
-                ViewMode::MoE => self.render_experts(frame, rows[3], d),
+                ViewMode::Heatmap => self.render_layers(frame, rows[2], d),
+                ViewMode::MoE => self.render_experts(frame, rows[2], d),
                 _ => {
                     let split = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                        .split(rows[3]);
+                        .split(rows[2]);
                     self.render_layers(frame, split[0], d);
                     self.render_experts(frame, split[1], d);
                 }
             }
         }
-        if rows[4].height > 0 {
-            self.render_requests(frame, rows[4], d);
+        if rows[3].height > 0 {
+            self.render_requests(frame, rows[3], d);
         }
-        self.render_footer(frame, rows[5], d);
     }
 
     // -----------------------------------------------------------------------
@@ -209,7 +249,15 @@ impl Renderer {
             pal::c((10, 12, 18))
         };
         let spinner = if phase == Phase::Idle { "●" } else { self.spinner() };
-        let right = Line::from(vec![
+        let mut right_spans: Vec<Span> = Vec::new();
+        if d.models.len() > 1 {
+            right_spans.push(Span::styled(
+                format!(" model {}/{} ", d.focus + 1, d.models.len()),
+                Style::default().fg(pal::c(pal::VIOLET)).add_modifier(Modifier::BOLD),
+            ));
+        }
+        let right = Line::from({
+            right_spans.extend([
             Span::styled(
                 format!(" {spinner} {badge_txt} "),
                 Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD),
@@ -218,7 +266,9 @@ impl Renderer {
                 format!(" up {}  {} ", fmt_clock(d.perf.uptime()), chrono::Local::now().format("%H:%M:%S")),
                 Style::default().fg(pal::c(pal::TEXT_DIM)),
             ),
-        ])
+            ]);
+            right_spans
+        })
         .right_aligned();
 
         let (block, _) = with_right(panel(" ◆ LLM VISUALS ", pal::CYAN), " ◆ LLM VISUALS ", right, area);
@@ -597,9 +647,21 @@ impl Renderer {
                 g.vram_gb(),
                 g.vram_total_gb()
             );
-            let legend_w = if w > 78 { 22 } else { 0 };
+            // With several models sharing the box, say which ones live here.
+            let tenants: Vec<usize> = if d.models.len() > 1 {
+                d.models
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.detected.gpu_indices.contains(&g.index))
+                    .map(|(i, _)| i)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let tenant_w = if tenants.is_empty() { 0 } else { 2 + 2 * tenants.len() };
+            let legend_w = if w > 78 + tenant_w { 22 } else { 0 };
             let bar_w = w
-                .saturating_sub(label.len() + txt.len() + legend_w)
+                .saturating_sub(label.len() + txt.len() + legend_w + tenant_w)
                 .clamp(4, 40);
             let mut spans = vec![Span::styled(label, Style::default().fg(pal::c(pal::TEXT_DIM)))];
             spans.extend(vram_bar(bar_w, used, weights, kv, kv_fill, d.fade.processing, self.pulse()));
@@ -607,6 +669,22 @@ impl Renderer {
                 txt,
                 Style::default().fg(pal::vu(used)).add_modifier(Modifier::BOLD),
             ));
+            if !tenants.is_empty() {
+                spans.push(Span::styled("⟨", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                for (k, i) in tenants.iter().enumerate() {
+                    if k > 0 {
+                        spans.push(Span::styled(",", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                    }
+                    let focused = *i == d.focus;
+                    spans.push(Span::styled(
+                        format!("{}", i + 1),
+                        Style::default()
+                            .fg(pal::c(if focused { pal::CYAN } else { pal::TEXT_DIM }))
+                            .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
+                    ));
+                }
+                spans.push(Span::styled("⟩ ", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+            }
             if legend_w > 0 {
                 spans.push(Span::styled("■", Style::default().fg(pal::c(pal::BLUE))));
                 spans.push(Span::styled(
@@ -1366,39 +1444,489 @@ impl Renderer {
     // -----------------------------------------------------------------------
 
     fn render_footer(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
-        let key = |k: &str, label: &str, active: bool| -> Vec<Span<'static>> {
-            let kc = if active { pal::CYAN } else { pal::TEXT };
-            vec![
-                Span::styled(
-                    format!(" {k}"),
-                    Style::default().fg(pal::c(kc)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" {label}"),
-                    Style::default().fg(pal::c(if active { pal::CYAN } else { pal::TEXT_DIM })),
-                ),
-            ]
-        };
-        let mut spans: Vec<Span> = Vec::new();
-        spans.extend(key("q", "quit", false));
-        spans.extend(key("a", "all", d.view == ViewMode::All));
-        spans.extend(key("p", "perf", d.view == ViewMode::Perf));
-        spans.extend(key("h", "layers", d.view == ViewMode::Heatmap));
-        spans.extend(key("m", "experts", d.view == ViewMode::MoE));
-        spans.extend(key("b", "bandwidth", d.view == ViewMode::Bandwidth));
-        spans.extend(key("t", &format!("theme:{}", d.theme_name), false));
-        spans.extend(key("r", "rescan", false));
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let w = area.width as usize;
-        let color_tag = if pal::truecolor() { "24-bit" } else { "256c" };
-        let status = format!("{}  {} ", truncate(d.status, w.saturating_sub(used + 12)), color_tag);
-        let pad = w.saturating_sub(used + status.chars().count());
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(status, Style::default().fg(pal::c(pal::TEXT_MUTED))));
+        let multi = d.models.len() > 1;
+        // Full labels first; the model keys made the row long enough that a
+        // narrow terminal now needs short ones, then shedding from the end.
+        let mut items: Vec<(&str, String, bool)> = vec![
+            ("q", "quit".into(), false),
+            ("a", "all".into(), d.view == ViewMode::All),
+            ("p", "perf".into(), d.view == ViewMode::Perf),
+            ("h", "layers".into(), d.view == ViewMode::Heatmap),
+            ("m", "experts".into(), d.view == ViewMode::MoE),
+            ("b", "bandwidth".into(), d.view == ViewMode::Bandwidth),
+        ];
+        if multi {
+            items.push(("v", "compare".into(), d.view == ViewMode::Models));
+            items.push((
+                "↹",
+                format!("model {}/{}", d.focus + 1, d.models.len()),
+                false,
+            ));
+        }
+        items.push(("t", format!("theme:{}", d.theme_name), false));
+        items.push(("r", "rescan".into(), false));
+
+        let cost = |it: &[(&str, String, bool)]| -> usize {
+            it.iter()
+                .map(|(k, l, _)| k.chars().count() + l.chars().count() + 2)
+                .sum()
+        };
+        if cost(&items) + 14 > w {
+            for (k, l, _) in items.iter_mut() {
+                match *k {
+                    "t" => *l = "theme".into(),
+                    "b" => *l = "bw".into(),
+                    "↹" => *l = format!("{}/{}", d.focus + 1, d.models.len()),
+                    _ => {}
+                }
+            }
+        }
+        while cost(&items) > w && items.len() > 3 {
+            items.pop();
+        }
+
+        let mut spans: Vec<Span> = Vec::new();
+        for (k, label, active) in &items {
+            let kc = if *active { pal::CYAN } else { pal::TEXT };
+            spans.push(Span::styled(
+                format!(" {k}"),
+                Style::default().fg(pal::c(kc)).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(pal::c(if *active { pal::CYAN } else { pal::TEXT_DIM })),
+            ));
+        }
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        // The status and colour tag take whatever the keys left over.
+        let free = w.saturating_sub(used);
+        if free >= 10 {
+            let color_tag = if pal::truecolor() { "24-bit" } else { "256c" };
+            let status = format!(
+                "{}  {} ",
+                truncate(d.status, free.saturating_sub(color_tag.len() + 4)),
+                color_tag
+            );
+            let pad = free.saturating_sub(status.chars().count());
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(status, Style::default().fg(pal::c(pal::TEXT_MUTED))));
+        }
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(pal::c(pal::PANEL))),
             area,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multiple models: the strip under the header, and the side-by-side view (v)
+// ---------------------------------------------------------------------------
+
+/// Phase colour and label shared by the strip and the comparison cards.
+fn phase_badge(phase: Phase) -> ((u8, u8, u8), &'static str) {
+    match phase {
+        Phase::Idle => (pal::TEXT_MUTED, "idle"),
+        Phase::Prefill => (pal::MAGENTA, "prefill"),
+        Phase::Decode => (pal::CYAN, "decode"),
+    }
+}
+
+impl Renderer {
+    /// One line per model: index, name, phase, rate, recent history, context
+    /// fill and VRAM. Segments are dropped from the right as the terminal
+    /// narrows, so the index and the rate always survive.
+    fn render_models_bar(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let n = d.models.len();
+        let busy = d.models.iter().filter(|m| m.perf.phase != Phase::Idle).count();
+        let title = format!(" ◆ MODELS  {n} ");
+        let right = Line::from(vec![
+            Span::styled(
+                format!(" {busy} busy "),
+                Style::default().fg(pal::c(if busy > 0 { pal::CYAN } else { pal::TEXT_MUTED })),
+            ),
+            Span::styled(
+                "↹ switch · v compare ",
+                Style::default().fg(pal::c(pal::TEXT_MUTED)),
+            ),
+        ])
+        .right_aligned();
+        let (block, _) = with_right(panel(&title, pal::VIOLET), &title, right, area);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width < 12 {
+            return;
+        }
+        // Scroll so the focused model is always on screen.
+        let rows = inner.height as usize;
+        let start = if d.focus >= rows { d.focus + 1 - rows } else { 0 };
+        let lines: Vec<Line> = d
+            .models
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(rows)
+            .map(|(i, m)| self.model_row(i, m, d, inner.width as usize))
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+
+    fn model_row(&self, i: usize, m: &ModelView, d: &Dashboard, w: usize) -> Line<'static> {
+        let focused = i == d.focus;
+        let p = m.perf;
+        let (badge_rgb, badge) = phase_badge(p.phase);
+        let name_style = if focused {
+            Style::default().fg(pal::c(pal::WHITE)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal::c(pal::TEXT))
+        };
+
+        // Budget: the index, name, phase and rate are the core; history,
+        // context and VRAM are added while there is room.
+        let idx_w = 4;
+        let phase_w = 9;
+        let rate_w = 13;
+        let core = idx_w + phase_w + rate_w;
+        let name_w = (w / 4).clamp(8, 24).min(w.saturating_sub(core + 2).max(6));
+        let mut spare = w.saturating_sub(core + name_w + 1);
+        let show_vram = spare >= 10;
+        if show_vram {
+            spare -= 9;
+        }
+        let show_ctx = spare >= 14;
+        if show_ctx {
+            spare -= 14;
+        }
+        let spark_w = if spare >= 8 { spare.min(60) } else { 0 };
+
+        let mut spans: Vec<Span> = vec![
+            Span::styled(
+                if focused { "▌" } else { " " },
+                Style::default().fg(pal::c(pal::CYAN)),
+            ),
+            Span::styled(
+                format!("{} ", i + 1),
+                Style::default()
+                    .fg(pal::c(if focused { pal::CYAN } else { pal::TEXT_MUTED }))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<w$} ", truncate(&m.detected.short_name(), name_w), w = name_w),
+                name_style,
+            ),
+        ];
+
+        // Phase: a lit dot while the server is working, so a busy model reads
+        // at a glance even in a list of six.
+        let dot_glow = if p.phase == Phase::Idle {
+            0.6
+        } else {
+            0.6 + 0.4 * self.pulse()
+        };
+        spans.push(Span::styled(
+            "● ",
+            Style::default().fg(pal::c(pal::dim_rgb(badge_rgb, dot_glow))),
+        ));
+        spans.push(Span::styled(
+            format!("{badge:<7}"),
+            Style::default().fg(pal::c(badge_rgb)),
+        ));
+
+        let rate = p.decode_tps_smooth;
+        spans.push(Span::styled(
+            format!("{:>6}", fmt_rate(rate)),
+            Style::default()
+                .fg(if rate > 0.0 {
+                    pal::gradient_color(pal::FLOW, 0.85)
+                } else {
+                    pal::c(pal::TEXT_MUTED)
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " tok/s ",
+            Style::default().fg(pal::c(pal::TEXT_MUTED)),
+        ));
+
+        if spark_w > 0 {
+            let hist: Vec<f32> = p.decode_hist.iter().copied().collect();
+            let rows = sparkline(&hist, spark_w, 1, p.peak_decode_tps.max(10.0), pal::FLOW);
+            spans.extend(rows.into_iter().next().unwrap_or_default());
+            spans.push(Span::raw(" "));
+        }
+
+        if show_ctx {
+            let ctx_max = m.live.ctx_max.max(1);
+            let used = m.live.ctx_used().min(ctx_max);
+            let frac = used as f32 / ctx_max as f32;
+            spans.push(Span::styled(
+                "ctx ",
+                Style::default().fg(pal::c(pal::TEXT_MUTED)),
+            ));
+            spans.extend(gauge(frac, None, 6, GaugeStyle::Vu));
+            spans.push(Span::styled(
+                format!("{:>3.0}% ", frac * 100.0),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
+        }
+
+        if show_vram {
+            let gb = m.detected.mem_used_mb as f32 / 1024.0;
+            spans.push(Span::styled(
+                format!("{gb:>5.1}G "),
+                Style::default().fg(pal::c(pal::BLUE)),
+            ));
+        }
+
+        Line::from(fit_spans(&spans, w))
+    }
+
+    /// The comparison view (v): one card per model, laid out in a grid.
+    fn render_compare(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        if d.models.is_empty() {
+            let block = panel(" ◆ MODELS ", pal::VIOLET);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " nothing to compare — no inference server detected ",
+                    Style::default().fg(pal::c(pal::AMBER)),
+                ))),
+                inner,
+            );
+            return;
+        }
+        let n = d.models.len();
+        // 28 columns is the narrowest a card stays readable at.
+        let per_row = (area.width as usize / 28).clamp(1, 4).min(n);
+        let n_rows = n.div_ceil(per_row);
+        let row_areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![Constraint::Ratio(1, n_rows as u32); n_rows])
+            .split(area);
+        for r in 0..n_rows {
+            let first = r * per_row;
+            let count = per_row.min(n - first);
+            let cells = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![Constraint::Ratio(1, count as u32); count])
+                .split(row_areas[r]);
+            for c in 0..count {
+                self.render_model_card(frame, cells[c], first + c, d);
+            }
+        }
+    }
+
+    fn render_model_card(&self, frame: &mut Frame, area: Rect, i: usize, d: &Dashboard) {
+        let m = &d.models[i];
+        let p = m.perf;
+        let focused = i == d.focus;
+        let (badge_rgb, badge) = phase_badge(p.phase);
+        let title = format!(" {} {} ", i + 1, truncate(&m.detected.short_name(), area.width.saturating_sub(8) as usize));
+        let accent = if focused { pal::CYAN } else { pal::BORDER };
+        let mut block = panel(&title, if focused { pal::WHITE } else { pal::TEXT_DIM });
+        if focused {
+            block = block.border_style(Style::default().fg(pal::c(accent)));
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 10 || inner.height < 3 {
+            return;
+        }
+        let w = inner.width as usize;
+        let h = inner.height as usize;
+        let mut lines: Vec<Line> = Vec::with_capacity(h);
+        let dim = Style::default().fg(pal::c(pal::TEXT_DIM));
+        let muted = Style::default().fg(pal::c(pal::TEXT_MUTED));
+
+        // Phase badge + engine.
+        let glow = if p.phase == Phase::Idle { 0.55 } else { 0.75 + 0.35 * self.pulse() };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", badge.to_uppercase()),
+                Style::default()
+                    .fg(pal::c(if p.phase == Phase::Idle { pal::TEXT_DIM } else { (10, 12, 18) }))
+                    .bg(pal::c(pal::dim_rgb(badge_rgb, glow)))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", m.detected.engine), muted),
+            Span::styled(
+                match m.detected.port {
+                    Some(port) => format!(":{port}"),
+                    None => String::new(),
+                },
+                muted,
+            ),
+        ]));
+
+        // Decode rate: big numerals where the card is tall enough for them.
+        let rate = p.decode_tps_smooth;
+        if h >= 11 && w >= 18 {
+            let digits = big_digits(fmt_rate_short(rate));
+            let dw = digits[0].chars().count();
+            for (row, glyph_row) in digits.iter().enumerate() {
+                let mut spans: Vec<Span> = Vec::new();
+                for (x, ch) in glyph_row.chars().enumerate() {
+                    let t = x as f32 / dw.max(1) as f32;
+                    let col = if rate > 0.0 {
+                        pal::gradient_color(pal::FLOW, 0.25 + 0.7 * t)
+                    } else {
+                        pal::c(pal::TEXT_MUTED)
+                    };
+                    spans.push(Span::styled(ch.to_string(), Style::default().fg(col)));
+                }
+                spans.push(Span::raw("  "));
+                if row == 0 {
+                    spans.push(Span::styled("tok/s", dim));
+                } else if row == 1 {
+                    spans.push(Span::styled(
+                        format!("pk {}", fmt_rate(p.peak_decode_tps)),
+                        muted,
+                    ));
+                }
+                lines.push(Line::from(fit_spans(&spans, w)));
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:>7}", fmt_rate(rate)),
+                    Style::default()
+                        .fg(pal::gradient_color(pal::FLOW, 0.85))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" tok/s", dim),
+            ]));
+        }
+
+        let kv = |k: &str, v: String, col: (u8, u8, u8)| -> Line<'static> {
+            Line::from(vec![
+                Span::styled(format!("{k:<8}"), muted),
+                Span::styled(v, Style::default().fg(pal::c(col))),
+            ])
+        };
+        lines.push(kv(
+            "prefill",
+            format!("{} tok/s", fmt_rate(p.prefill_tps_smooth)),
+            pal::MAGENTA,
+        ));
+        let ttft = p
+            .current
+            .as_ref()
+            .and_then(|r| r.ttft())
+            .or_else(|| p.history.back().and_then(|r| r.ttft()));
+        lines.push(kv(
+            "ttft",
+            ttft.map(fmt_dur).unwrap_or_else(|| "—".into()),
+            pal::AMBER,
+        ));
+
+        // Context fill.
+        let ctx_max = m.live.ctx_max.max(1);
+        let used = m.live.ctx_used().min(ctx_max);
+        let frac = used as f32 / ctx_max as f32;
+        let bar_w = w.saturating_sub(14).clamp(4, 20);
+        let mut ctx_spans = vec![Span::styled(format!("{:<8}", "ctx"), muted)];
+        ctx_spans.extend(gauge(frac, None, bar_w, GaugeStyle::Vu));
+        ctx_spans.push(Span::styled(
+            format!(" {:>3.0}%", frac * 100.0),
+            Style::default().fg(pal::vu(frac)),
+        ));
+        lines.push(Line::from(fit_spans(&ctx_spans, w)));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<8}", ""), muted),
+            Span::styled(
+                format!("{} / {}", fmt_int(used), fmt_int(ctx_max)),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ),
+        ]));
+
+        if p.spec.available && p.spec.totals.draft_tokens > 0 {
+            lines.push(kv(
+                "accept",
+                format!("{:.0}%", p.spec.accept_rate * 100.0),
+                pal::GREEN,
+            ));
+        }
+        if let Some(g) = &m.detected.gguf {
+            if g.is_moe() {
+                lines.push(kv(
+                    "moe",
+                    format!("{}/{} experts", g.n_experts_used, g.n_experts),
+                    pal::VIOLET,
+                ));
+            }
+            lines.push(kv("shape", format!("{}L × {}H", g.n_layers, g.n_heads), pal::TEXT));
+        }
+        lines.push(kv(
+            "vram",
+            format!("{:.1} G", m.detected.mem_used_mb as f32 / 1024.0),
+            pal::BLUE,
+        ));
+        if !m.detected.gpu_indices.is_empty() {
+            lines.push(kv(
+                "gpu",
+                m.detected
+                    .gpu_indices
+                    .iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                pal::AMBER,
+            ));
+        }
+        lines.push(kv(
+            "session",
+            format!("{} req · {} gen", p.session_requests, fmt_compact(p.session_decoded as f32)),
+            pal::TEXT_DIM,
+        ));
+
+        // History sits at the foot of the card: decode always, prefill too
+        // when the card is tall. Both are capped — past ten rows or so a
+        // sparkline turns into a solid block of ink rather than saying more.
+        let remaining = h.saturating_sub(lines.len());
+        if remaining >= 3 {
+            let dec_rows = (remaining - 1).min(10);
+            let left = remaining - dec_rows - 1;
+            let pre_rows = if left >= 3 { (left - 1).min(6) } else { 0 };
+            let used = dec_rows + 1 + if pre_rows > 0 { pre_rows + 1 } else { 0 };
+            for _ in 0..remaining - used {
+                lines.push(Line::default());
+            }
+            let mut block = |label: &str,
+                             hist: &std::collections::VecDeque<f32>,
+                             max: f32,
+                             rows: usize,
+                             grad: &[(f32, (u8, u8, u8))],
+                             col: (u8, u8, u8)| {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{label:<8}"), Style::default().fg(pal::c(col))),
+                    Span::styled(format!("max {}", fmt_rate(max)), muted),
+                ]));
+                let v: Vec<f32> = hist.iter().copied().collect();
+                for r in sparkline(&v, w, rows, max, grad) {
+                    lines.push(Line::from(r));
+                }
+            };
+            block(
+                "decode",
+                &p.decode_hist,
+                p.peak_decode_tps.max(10.0),
+                dec_rows,
+                pal::FLOW,
+                pal::CYAN,
+            );
+            if pre_rows > 0 {
+                block(
+                    "prefill",
+                    &p.prefill_hist,
+                    p.peak_prefill_tps.max(100.0),
+                    pre_rows,
+                    pal::PREFILL,
+                    pal::MAGENTA,
+                );
+            }
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 }
 
@@ -2381,7 +2909,7 @@ mod tests {
 
     #[test]
     fn quant_tag_from_gguf_name() {
-        let mut m = crate::demo::demo_model(4096);
+        let mut m = crate::demo::demo_models(4096, 1).remove(0);
         m.path = Some("/m/Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf".into());
         assert_eq!(quant_from_path(&m).as_deref(), Some("Q3_K_XL"));
         m.path = Some("/m/llama-8b.IQ4_XS.gguf".into());

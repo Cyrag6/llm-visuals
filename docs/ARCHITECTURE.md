@@ -4,56 +4,69 @@ llm-visuals is a single Rust binary built on [ratatui](https://ratatui.rs) and
 tokio. It has no agents inside the inference server: everything it shows is
 polled over HTTP or read from `nvidia-smi`, then derived and smoothed locally.
 
+Every inference server on the machine is watched at once. Each gets a
+`ModelSlot` in the frame loop — its own `PerfTracker` and `FadeState` — and
+its own HTTP poller. Samples carry the model's PID so the frame loop can route
+them; the hardware collectors (`nvidia-smi`, `/proc`) stay shared, because the
+GPUs and the disk are shared.
+
 ```
-                ┌──────────────┐  every poll_ms (200 ms)   ┌───────────────┐
- llama-server ──┤ /slots       ├──────────────────────────►│ observe.rs    │
-                │ /metrics     │                            │ LiveStats     │
-                │ /experts     │                            │ SpecMetrics   │
-                └──────────────┘                            │ ExpertStats   │
-                                                            └──────┬────────┘
-                ┌──────────────┐  every 200 ms                     │ mpsc channels
- nvidia-smi ────┤ --query-gpu  ├──────────────► gpu.rs ────────────┤
-                └──────────────┘                GpuStats           │
-                ┌──────────────┐  every 400 ms                     │
- /proc ─────────┤ diskstats    ├──────────────► host.rs ───────────┤
- nvidia-smi ────┤ pid/io,stat  │                HostSample         │
-                │ dmon -s t    │                                   │
-                └──────────────┘                                   ▼
-                                                        ┌────────────────────┐
- model_detect.rs ─ /proc + compute apps ─► DetectedModel│ main.rs event loop │
- gguf.rs ──────── GGUF header ───────────► GgufInfo     │  ~30 fps           │
-                                                        └───┬──────────┬─────┘
-                                                            │          │
-                                                 perf.rs ◄──┘          └──► fade.rs
-                                                 rates, TTFT,               attack/release
-                                                 request log,               smoothing,
-                                                 MTP acceptance,            expert heat
-                                                 peak hold
-                                                            │          │
-                                                            ▼          ▼
-                                                        ┌────────────────────┐
-                                                        │ render.rs          │
-                                                        │ Dashboard → panels │
-                                                        └────────────────────┘
+ one poller per model, every poll_ms (200 ms)
+                ┌──────────────┐                           ┌───────────────┐
+ llama-server A ┤ /slots       ├──────────────────────────►│ observe.rs    │
+      :8080     │ /metrics     │                           │ LiveStats     │
+                │ /experts     │                           │ SpecMetrics   │
+                └──────────────┘                           │ ExpertStats   │
+                ┌──────────────┐                           │  tagged (pid) │
+ llama-server B ┤ /slots …     ├──────────────────────────►│               │
+      :8081     └──────────────┘                           └──────┬────────┘
+                                                                  │ mpsc channels
+                ┌──────────────┐  every 200 ms, shared            │
+ nvidia-smi ────┤ --query-gpu  ├──────────────► gpu.rs ───────────┤
+                └──────────────┘                GpuStats          │
+                ┌──────────────┐  every 400 ms, one pass          │
+ /proc ─────────┤ diskstats    ├──────────────► host.rs ──────────┤
+ nvidia-smi ────┤ pid/io,stat  │            Vec<(pid,HostSample)> │
+                │ dmon -s t    │                                  ▼
+                └──────────────┘              ┌─────────────────────────────────┐
+                                              │ main.rs event loop  ~30 fps     │
+ model_detect.rs ─ /proc + compute apps ─────►│ routes each sample by pid into  │
+ gguf.rs ──────── GGUF header ───────────────►│ ModelSlot { perf, fade, live }  │
+                                              └───┬──────────┬──────────────────┘
+                                                  │          │
+                                       perf.rs ◄──┘          └──► fade.rs
+                                       rates, TTFT,               attack/release
+                                       request log,               smoothing,
+                                       MTP acceptance,            expert heat
+                                       peak hold          (one of each per model)
+                                                  │          │
+                                                  ▼          ▼
+                                              ┌────────────────────────┐
+                                              │ render.rs              │
+                                              │ Dashboard {            │
+                                              │   models: [ModelView], │
+                                              │   focus,               │
+                                              │ } → panels             │
+                                              └────────────────────────┘
 ```
 
 ## Modules
 
 | Module | Responsibility |
 |---|---|
-| `main.rs` | CLI parsing, terminal setup, spawning pollers, the frame loop, key handling |
+| `main.rs` | CLI parsing, terminal setup, the `ModelSlot` list, spawning one poller per model, routing samples by PID, the frame loop, key handling |
 | `config.rs` | clap arguments and `ViewMode` |
-| `model_detect.rs` | finds inference processes via `nvidia-smi --query-compute-apps` and `/proc`, parses their command lines (model path, port, ctx size, tensor split, spec mode) |
+| `model_detect.rs` | finds inference processes via `nvidia-smi --query-compute-apps` and `/proc`, parses their command lines (model path, port, ctx size, tensor split, spec mode); returns every server found, best first, minus this process and idle daemons |
 | `gguf.rs` | reads the GGUF header without loading tensors; maps layers to GPUs from `--tensor-split`; `read_tensor_summary` walks the tensor table and sizes each tensor from the gap to the next offset (no quant type table needed) |
 | `observe.rs` | HTTP GET with timeouts; parsers for `/slots`, `/metrics` (Prometheus text) and `/experts` |
 | `gpu.rs` | `nvidia-smi` CSV collector on a `spawn_blocking` thread; smooth random-walk demo GPUs |
 | `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers; `Meter` (VU channel with peak hold and auto scale) and `BandwidthStats` for the pipeline view |
-| `host.rs` | host counters: `/proc/diskstats`, `/proc/<pid>/io`, `/proc/<pid>/stat` (major faults), `/proc/<pid>/status` (`RssFile`), `/proc/meminfo`, and PCIe rx/tx per GPU from `nvidia-smi dmon -s t -c 1` |
+| `host.rs` | host counters: `/proc/diskstats`, `/proc/<pid>/io`, `/proc/<pid>/stat` (major faults), `/proc/<pid>/status` (`RssFile`), `/proc/meminfo`, and PCIe rx/tx per GPU from `nvidia-smi dmon -s t -c 1`. The system-wide reads happen once per poll and are shared across every PID, so watching six models costs the same `nvidia-smi` calls as watching one |
 | `bandwidth.rs` | `weight_layout` (bytes total / active / CPU-side from the GGUF tensor table and VRAM use) and `assess`, the rule chain that names the bottleneck stage |
 | `fade.rs` | time-based smoothing so the UI breathes: fast attack, slow release; per-expert heat that cools exponentially |
-| `demo.rs` | a synthetic server (prefill → decode → idle loop) that emits `LiveStats`, `SpecMetrics`, `ExpertStats` and GPU samples through the same channels |
+| `demo.rs` | synthetic servers (`--demo-models N`, each a prefill → decode → idle loop with its own profile) emitting `LiveStats`, `SpecMetrics` and `ExpertStats` through the same tagged channels; one extra task walks the shared GPUs and host counters from their combined load |
 | `colors.rs` | truecolor / 256-colour gating, gradients, palette constants, themes |
-| `render.rs` | the `Dashboard` view-model and every panel; gauges, sparklines, big digits, layout rules |
+| `render.rs` | the `Dashboard` view-model (every `ModelView` plus the focused index) and every panel; the models strip and comparison view walk all of them, the rest use the focused one; gauges, sparklines, big digits, layout rules |
 | `pipeline.rs`, `llm/` | attention buffers for the optional Python transformers bridge (`--model <hf id>`) |
 
 ## Data contracts
@@ -73,7 +86,14 @@ windowed ratio of the first two.
 routings and a 256-token histogram. See `patches/README.md`.
 
 Each optional endpoint is probed at start and after a rescan; after three
-failures the poller stops asking, so unpatched or older servers cost nothing.
+failures that model's poller stops asking, so unpatched or older servers cost
+nothing. The judgement is per model: a patched server next to an unpatched one
+still gets its expert routing.
+
+A rescan aborts every poller and starts fresh ones for what it finds. Slots
+are matched to the new scan by PID, so a model that is still running keeps its
+counters, history and request log, and one that has gone away stops being
+polled immediately.
 
 **Host counters** are cumulative, so `BandwidthStats::observe_host` takes
 deltas over the poll interval. `nvidia-smi dmon` is already a rate (MB/s
@@ -113,8 +133,13 @@ prefill it is `prefill tok/s ÷ ubatch`.
   and then falls at 40 % of scale per second.
 - Sparklines are right-aligned in time (newest at the right edge) and coloured
   by level with a gradient.
-- Layout sheds panels below 26 rows (requests) and 20 rows (context/MTP); the
-  GPU line sheds PCIe, fan, clock, temperature before shrinking its gauge.
+- Layout sheds the models strip first (it needs 14 rows of body beneath it),
+  then requests below 22 body rows and context/MTP below 16; the GPU line
+  sheds PCIe, fan, clock, temperature before shrinking its gauge, and the key
+  row shortens its own labels before dropping keys from the end.
+- The models strip gives each row a fixed budget — index, name, phase and rate
+  always survive — and spends what is left on history, then context, then
+  VRAM, so every row's columns line up at any width.
 
 ## Testing
 

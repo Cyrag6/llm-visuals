@@ -1,6 +1,9 @@
-//! Synthetic inference server + GPUs so the dashboard runs without hardware.
+//! Synthetic inference servers + GPUs so the dashboard runs without hardware.
+//! `--demo-models N` starts N of them on one set of synthetic cards, which is
+//! how the multi-model panels are exercised without a rack.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -11,39 +14,166 @@ use crate::host::HostSample;
 use crate::model_detect::DetectedModel;
 use crate::observe::{ExpertLayer, ExpertStats, LiveStats, SpecMetrics};
 
-pub fn demo_model(ctx_max: usize) -> DetectedModel {
+/// How one synthetic server behaves: its shape on paper and its speed.
+struct DemoProfile {
+    name: &'static str,
+    file: &'static str,
+    arch: &'static str,
+    n_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_experts: usize,
+    n_experts_used: usize,
+    n_mtp: usize,
+    n_embd: usize,
+    file_bytes: u64,
+    expert_bytes: u64,
+    embd_bytes: u64,
+    mem_used_mb: u64,
+    gpus: &'static [u32],
+    tensor_split: &'static [f32],
+    /// Decode tokens/s and prefill tokens/s the profile settles around.
+    decode_tps: f32,
+    prefill_tps: f32,
+    ctx_frac: f32,
+}
+
+const PROFILES: &[DemoProfile] = &[
+    DemoProfile {
+        name: "Qwen3-Demo-35B-A3B",
+        file: "/models/qwen3-demo-35b-a3b-Q4_K_M.gguf",
+        arch: "qwen3moe",
+        n_layers: 41,
+        n_heads: 16,
+        n_kv_heads: 4,
+        n_experts: 256,
+        n_experts_used: 8,
+        n_mtp: 1,
+        n_embd: 2048,
+        file_bytes: 19_800_000_000,
+        expert_bytes: 17_100_000_000,
+        embd_bytes: 540_000_000,
+        mem_used_mb: 18_900,
+        gpus: &[0, 1],
+        tensor_split: &[63.0, 37.0],
+        decode_tps: 48.0,
+        prefill_tps: 1150.0,
+        ctx_frac: 1.0,
+    },
+    DemoProfile {
+        name: "Llama-Demo-8B-Instruct",
+        file: "/models/llama-demo-8b-instruct-Q5_K_M.gguf",
+        arch: "llama",
+        n_layers: 32,
+        n_heads: 32,
+        n_kv_heads: 8,
+        n_experts: 0,
+        n_experts_used: 0,
+        n_mtp: 0,
+        n_embd: 4096,
+        file_bytes: 5_700_000_000,
+        expert_bytes: 0,
+        embd_bytes: 420_000_000,
+        mem_used_mb: 6_400,
+        gpus: &[0],
+        tensor_split: &[],
+        decode_tps: 92.0,
+        prefill_tps: 2600.0,
+        ctx_frac: 0.25,
+    },
+    DemoProfile {
+        name: "Gemma-Demo-2B",
+        file: "/models/gemma-demo-2b-Q4_K_S.gguf",
+        arch: "gemma2",
+        n_layers: 26,
+        n_heads: 8,
+        n_kv_heads: 4,
+        n_experts: 0,
+        n_experts_used: 0,
+        n_mtp: 0,
+        n_embd: 2304,
+        file_bytes: 1_600_000_000,
+        expert_bytes: 0,
+        embd_bytes: 230_000_000,
+        mem_used_mb: 2_100,
+        gpus: &[1],
+        tensor_split: &[],
+        decode_tps: 165.0,
+        prefill_tps: 5200.0,
+        ctx_frac: 0.12,
+    },
+    DemoProfile {
+        name: "Mixtral-Demo-8x7B",
+        file: "/models/mixtral-demo-8x7b-Q3_K_M.gguf",
+        arch: "llama",
+        n_layers: 32,
+        n_heads: 32,
+        n_kv_heads: 8,
+        n_experts: 8,
+        n_experts_used: 2,
+        n_mtp: 0,
+        n_embd: 4096,
+        file_bytes: 22_500_000_000,
+        expert_bytes: 19_400_000_000,
+        embd_bytes: 300_000_000,
+        mem_used_mb: 21_800,
+        gpus: &[0, 1],
+        tensor_split: &[50.0, 50.0],
+        decode_tps: 31.0,
+        prefill_tps: 780.0,
+        ctx_frac: 0.5,
+    },
+];
+
+/// The synthetic servers for `--demo-models n`, cycling the profiles if asked
+/// for more than there are.
+pub fn demo_models(ctx_max: usize, n: usize) -> Vec<DetectedModel> {
+    (0..n.max(1))
+        .map(|i| demo_model_n(ctx_max, i))
+        .collect()
+}
+
+fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
+    let p = &PROFILES[idx % PROFILES.len()];
+    let ctx = ((ctx_max as f32 * p.ctx_frac) as usize).max(4096);
+    // Repeats past the profile list get their own name so the list stays legible.
+    let name = if idx >= PROFILES.len() {
+        format!("{}#{}", p.name, idx / PROFILES.len() + 1)
+    } else {
+        p.name.to_string()
+    };
     DetectedModel {
-        name: "Qwen3-Demo-35B-A3B".into(),
-        path: Some(PathBuf::from("/models/qwen3-demo-35b-a3b-Q4_K_M.gguf")),
-        pid: 4242,
+        name,
+        path: Some(PathBuf::from(p.file)),
+        pid: 4242 + idx as u32,
         process_name: "llama-server".into(),
         engine: "llama.cpp".into(),
-        gpu_indices: vec![0, 1],
-        mem_used_mb: 18_900,
-        port: Some(8080),
-        ctx_max: Some(ctx_max),
-        spec_type: Some("draft-mtp".into()),
+        gpu_indices: p.gpus.to_vec(),
+        mem_used_mb: p.mem_used_mb,
+        port: Some(8080 + idx as u16),
+        ctx_max: Some(ctx),
+        spec_type: if p.n_mtp > 0 { Some("draft-mtp".into()) } else { None },
         n_gpu_layers: Some(99),
-        tensor_split: vec![63.0, 37.0],
-        cmdline: "llama-server --demo".into(),
+        tensor_split: p.tensor_split.to_vec(),
+        cmdline: format!("llama-server --demo --port {}", 8080 + idx),
         gguf: Some(GgufInfo {
-            name: "Qwen3 Demo 35B A3B".into(),
-            architecture: "qwen3moe".into(),
-            n_layers: 41,
-            n_heads: 16,
-            n_kv_heads: 4,
-            n_experts: 256,
-            n_experts_used: 8,
-            ctx_train: ctx_max,
-            n_embd: 2048,
-            n_mtp: 1,
+            name: p.name.replace('-', " "),
+            architecture: p.arch.into(),
+            n_layers: p.n_layers,
+            n_heads: p.n_heads,
+            n_kv_heads: p.n_kv_heads,
+            n_experts: p.n_experts,
+            n_experts_used: p.n_experts_used,
+            ctx_train: ctx,
+            n_embd: p.n_embd,
+            n_mtp: p.n_mtp,
         }),
-        // Shaped like a real Q4 35B-A3B file: most bytes are expert tensors.
+        // Shaped like a real file of that class: for an MoE most bytes are experts.
         tensors: Some(crate::gguf::TensorSummary {
-            total_bytes: 19_800_000_000,
-            expert_bytes: 17_100_000_000,
-            embd_bytes: 540_000_000,
-            block_bytes: vec![19_800_000_000 / 41; 41],
+            total_bytes: p.file_bytes,
+            expert_bytes: p.expert_bytes,
+            embd_bytes: p.embd_bytes,
+            block_bytes: vec![p.file_bytes / p.n_layers as u64; p.n_layers],
             n_tensors: 753,
         }),
     }
@@ -54,39 +184,86 @@ fn next_f(seed: &mut u64) -> f32 {
     ((*seed >> 32) as u32 as f32) / (u32::MAX as f32)
 }
 
-/// One task drives slot counters and GPU walks together so they agree.
+/// Shared between the synthetic servers and the synthetic hardware: the cards
+/// have to react to every model at once, not just the one in front.
+#[derive(Default)]
+struct DemoShared {
+    /// Current load 0..1 contributed by each server.
+    loads: Vec<f32>,
+    /// Ticks of page-cache-miss disk burst still owed, from any server.
+    cold_ticks: u32,
+}
+
+/// Start one synthetic server per model plus one task that walks the shared
+/// GPUs and host counters from their combined load.
 pub fn spawn(
-    live_tx: mpsc::Sender<LiveStats>,
+    live_tx: mpsc::Sender<(u32, LiveStats)>,
     gpu_tx: mpsc::Sender<GpuSample>,
-    spec_tx: mpsc::Sender<SpecMetrics>,
-    experts_tx: mpsc::Sender<ExpertStats>,
-    host_tx: mpsc::Sender<HostSample>,
+    spec_tx: mpsc::Sender<(u32, SpecMetrics)>,
+    experts_tx: mpsc::Sender<(u32, ExpertStats)>,
+    host_tx: mpsc::Sender<Vec<(u32, HostSample)>>,
     num_gpus: usize,
-    ctx_max: usize,
+    models: &[DetectedModel],
+) {
+    let shared = Arc::new(Mutex::new(DemoShared {
+        loads: vec![0.0; models.len()],
+        cold_ticks: 0,
+    }));
+    for (i, model) in models.iter().enumerate() {
+        spawn_server(
+            i,
+            model.clone(),
+            live_tx.clone(),
+            spec_tx.clone(),
+            experts_tx.clone(),
+            Arc::clone(&shared),
+        );
+    }
+    spawn_hardware(gpu_tx, host_tx, num_gpus, models.to_vec(), shared);
+}
+
+/// One synthetic server: idle → prefill → decode, forever, at its profile's speed.
+fn spawn_server(
+    idx: usize,
+    model: DetectedModel,
+    live_tx: mpsc::Sender<(u32, LiveStats)>,
+    spec_tx: mpsc::Sender<(u32, SpecMetrics)>,
+    experts_tx: mpsc::Sender<(u32, ExpertStats)>,
+    shared: Arc<Mutex<DemoShared>>,
 ) {
     tokio::spawn(async move {
-        let mut gpus: Vec<DemoGpu> = (0..num_gpus.max(1)).map(DemoGpu::new).collect();
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let profile = &PROFILES[idx % PROFILES.len()];
+        let pid = model.pid;
+        let ctx_max = model.ctx_max.unwrap_or(32_768);
+        let gg = model.gguf.as_ref().unwrap();
+        let moe = gg.n_experts > 0;
+        // Each server gets its own seed so they do not move in lockstep.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_add((idx as u64 + 1).wrapping_mul(0x9E37_79B9));
         let tick = Duration::from_millis(200);
-        let mut id_task: i64 = 1000;
+        let mut id_task: i64 = 1000 + idx as i64 * 100;
         let mut cache_tokens: usize = 0;
         let mut spec = SpecMetrics::default();
-        let model = demo_model(ctx_max);
-        let gg = model.gguf.as_ref().unwrap();
         let mut experts = DemoExperts::new(gg.n_layers, gg.n_experts, gg.n_experts_used);
-        let mut host = DemoHost::new(num_gpus.max(1));
-        let mut tx = Emitters {
-            live_tx,
-            gpu_tx,
-            spec_tx,
-            experts_tx,
-            host_tx,
-        };
         let mut stats = LiveStats {
             ctx_max,
-            spec_types: "none,draft-mtp".into(),
+            spec_types: if gg.n_mtp > 0 { "none,draft-mtp".into() } else { "none".into() },
             n_slots: 1,
             ..Default::default()
+        };
+        // Stagger the starts so the models are not all prefilling together.
+        tokio::time::sleep(Duration::from_millis(150 * idx as u64)).await;
+
+        // Publishes this server's state; false once the dashboard has gone.
+        let emit = |stats: &LiveStats, load: f32| {
+            if let Ok(mut sh) = shared.lock() {
+                if let Some(slot) = sh.loads.get_mut(idx) {
+                    *slot = load;
+                }
+            }
+            !matches!(
+                live_tx.try_send((pid, stats.clone())),
+                Err(mpsc::error::TrySendError::Closed(_))
+            )
         };
 
         loop {
@@ -96,24 +273,33 @@ pub fn spawn(
             stats.prompt_processed = 0;
             stats.slots_busy = 0;
             for _ in 0..idle_ticks {
-                if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, 0.02).await.is_err() {
+                if !emit(&stats, 0.02) {
                     return;
+                }
+                let _ = spec_tx.try_send((pid, spec.clone()));
+                if moe {
+                    let _ = experts_tx.try_send((pid, experts.stats.clone()));
                 }
                 tokio::time::sleep(tick).await;
             }
 
             // ---- prefill ---------------------------------------------
             id_task += 1;
-            let prompt = 400 + (next_f(&mut seed) * 9000.0) as usize;
+            let prompt = (400.0 + next_f(&mut seed) * 9000.0) as usize;
+            let prompt = prompt.min(ctx_max.saturating_sub(600).max(64));
             let cached = if next_f(&mut seed) < 0.5 {
                 cache_tokens.min(prompt / 2)
             } else {
                 0
             };
-            let prefill_tps = 700.0 + next_f(&mut seed) * 900.0;
+            let prefill_tps = profile.prefill_tps * (0.8 + next_f(&mut seed) * 0.45);
             // One request in four finds part of the model evicted from the
             // page cache, so the disk meter has something real to show.
-            host.cold_ticks = if next_f(&mut seed) < 0.25 { 3 } else { 0 };
+            if next_f(&mut seed) < 0.25 {
+                if let Ok(mut sh) = shared.lock() {
+                    sh.cold_ticks = sh.cold_ticks.max(3);
+                }
+            }
             stats.id_task = id_task;
             stats.processing = true;
             stats.slots_busy = 1;
@@ -125,16 +311,22 @@ pub fn spawn(
                 let step = (prefill_tps * 0.2 * (0.85 + next_f(&mut seed) * 0.3)) as usize;
                 let before = stats.prompt_processed;
                 stats.prompt_processed = (stats.prompt_processed + step.max(1)).min(prompt);
-                experts.route(stats.prompt_processed - before, &mut seed);
-                if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, 0.95).await.is_err() {
+                if moe {
+                    experts.route(stats.prompt_processed - before, &mut seed);
+                }
+                if !emit(&stats, 0.95) {
                     return;
+                }
+                let _ = spec_tx.try_send((pid, spec.clone()));
+                if moe {
+                    let _ = experts_tx.try_send((pid, experts.stats.clone()));
                 }
                 tokio::time::sleep(tick).await;
             }
 
             // ---- decode ----------------------------------------------
             let gen = 40 + (next_f(&mut seed) * 500.0) as usize;
-            let base_tps = 28.0 + next_f(&mut seed) * 50.0;
+            let base_tps = profile.decode_tps * (0.75 + next_f(&mut seed) * 0.5);
             let mut t = 0.0f32;
             while stats.decoded < gen {
                 t += 0.2;
@@ -143,20 +335,30 @@ pub fn spawn(
                 let step = (tps * 0.2).round().max(1.0) as usize;
                 let before = stats.decoded;
                 stats.decoded = (stats.decoded + step).min(gen);
-                experts.route(stats.decoded - before, &mut seed);
+                if moe {
+                    experts.route(stats.decoded - before, &mut seed);
+                }
                 // MTP depth 1: every verification step drafts one token; the
                 // acceptance rate drifts so the panel has something to show.
-                let acc_rate = (0.62 + 0.25 * (t * 0.9).sin() + 0.08 * (t * 3.1).cos()).clamp(0.15, 0.95);
-                let accepted = (step as f32 * acc_rate / (1.0 + acc_rate)).round() as u64;
-                let steps = step as u64 - accepted;
-                spec.verify_steps += steps;
-                spec.draft_tokens += steps;
-                spec.accepted += accepted.min(steps);
-                spec.n_decode += steps;
+                if gg.n_mtp > 0 {
+                    let acc_rate = (0.62 + 0.25 * (t * 0.9).sin() + 0.08 * (t * 3.1).cos()).clamp(0.15, 0.95);
+                    let accepted = (step as f32 * acc_rate / (1.0 + acc_rate)).round() as u64;
+                    let steps = step as u64 - accepted;
+                    spec.verify_steps += steps;
+                    spec.draft_tokens += steps;
+                    spec.accepted += accepted.min(steps);
+                    spec.n_decode += steps;
+                } else {
+                    spec.n_decode += step as u64;
+                }
                 spec.tokens_predicted += step as u64;
                 let load = 0.55 + 0.35 * (tps / (base_tps * 1.3)).clamp(0.0, 1.0);
-                if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, load).await.is_err() {
+                if !emit(&stats, load) {
                     return;
+                }
+                let _ = spec_tx.try_send((pid, spec.clone()));
+                if moe {
+                    let _ = experts_tx.try_send((pid, experts.stats.clone()));
                 }
                 tokio::time::sleep(tick).await;
             }
@@ -164,7 +366,60 @@ pub fn spawn(
             stats.processing = false;
             stats.prompt_processed = 0;
             stats.slots_busy = 0;
-            if emit(&mut tx, &stats, &spec, &mut experts, &mut gpus, &mut host, 0.2).await.is_err() {
+            if !emit(&stats, 0.2) {
+                return;
+            }
+            tokio::time::sleep(tick).await;
+        }
+    });
+}
+
+/// The cards and host counters every synthetic server shares.
+fn spawn_hardware(
+    gpu_tx: mpsc::Sender<GpuSample>,
+    host_tx: mpsc::Sender<Vec<(u32, HostSample)>>,
+    num_gpus: usize,
+    models: Vec<DetectedModel>,
+    shared: Arc<Mutex<DemoShared>>,
+) {
+    tokio::spawn(async move {
+        let n = num_gpus.max(1);
+        let mut gpus: Vec<DemoGpu> = (0..n).map(DemoGpu::new).collect();
+        let mut host = DemoHost::new(n);
+        let tick = Duration::from_millis(200);
+        loop {
+            let (load, cold) = {
+                let mut sh = match shared.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                // Concurrent models contend: the busiest sets the floor, the
+                // rest push the cards the rest of the way up.
+                let peak = sh.loads.iter().copied().fold(0.0f32, f32::max);
+                let sum: f32 = sh.loads.iter().sum();
+                let cold = sh.cold_ticks > 0;
+                sh.cold_ticks = sh.cold_ticks.saturating_sub(1);
+                ((peak + 0.35 * (sum - peak)).min(1.0), cold)
+            };
+            host.cold_ticks = if cold { 1 } else { 0 };
+            let g: Vec<GpuStats> = gpus.iter_mut().map(|d| d.step(load)).collect();
+            if gpu_tx.send(Ok(g)).await.is_err() {
+                return;
+            }
+            let base = host.step(load, load > 0.1);
+            let batch: Vec<(u32, HostSample)> = models
+                .iter()
+                .map(|m| {
+                    let mut s = base.clone();
+                    // Resident weights scale with the file, so each model's
+                    // RAM-side figure is its own rather than the host's total.
+                    let bytes = m.tensors.as_ref().map(|t| t.total_bytes).unwrap_or(0);
+                    s.rss_file_bytes = Some((bytes as f64 * 0.31) as u64);
+                    s.rss_bytes = Some((bytes as f64 * 0.37) as u64);
+                    (m.pid, s)
+                })
+                .collect();
+            if host_tx.send(batch).await.is_err() {
                 return;
             }
             tokio::time::sleep(tick).await;
@@ -242,14 +497,6 @@ impl DemoExperts {
     }
 }
 
-struct Emitters {
-    live_tx: mpsc::Sender<LiveStats>,
-    gpu_tx: mpsc::Sender<GpuSample>,
-    spec_tx: mpsc::Sender<SpecMetrics>,
-    experts_tx: mpsc::Sender<ExpertStats>,
-    host_tx: mpsc::Sender<HostSample>,
-}
-
 /// Host counters for the demo: a page-cache miss burst on cold requests,
 /// PCIe traffic proportional to load (the second card holds offloaded
 /// layers so it sees more), and a fixed resident set.
@@ -312,21 +559,4 @@ impl DemoHost {
             pcie_ok: true,
         }
     }
-}
-
-async fn emit(
-    tx: &mut Emitters,
-    stats: &LiveStats,
-    spec: &SpecMetrics,
-    experts: &mut DemoExperts,
-    gpus: &mut [DemoGpu],
-    host: &mut DemoHost,
-    load: f32,
-) -> Result<(), ()> {
-    let g: Vec<GpuStats> = gpus.iter_mut().map(|d| d.step(load)).collect();
-    tx.gpu_tx.send(Ok(g)).await.map_err(|_| ())?;
-    tx.spec_tx.send(spec.clone()).await.map_err(|_| ())?;
-    tx.experts_tx.send(experts.stats.clone()).await.map_err(|_| ())?;
-    tx.host_tx.send(host.step(load, stats.processing)).await.map_err(|_| ())?;
-    tx.live_tx.send(stats.clone()).await.map_err(|_| ())
 }

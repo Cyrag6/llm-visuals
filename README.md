@@ -327,6 +327,26 @@ need the file.
 may be using a different slot; the dashboard follows the busy slot when there
 is one. Check `GET /slots` on the server.
 
+**Context, cache-hit and decoded counters sit at zero on a multi-slot server.**
+Known limitation. `llama-server` started with more than one slot (`-np`, or the
+default on recent builds) only fills in `n_prompt_tokens`,
+`n_prompt_tokens_cache`, `n_prompt_tokens_processed` and `next_token` on slots
+that have actually served a request; the untouched ones are stubs carrying
+`id`, `n_ctx`, `speculative` and `is_processing` and nothing else. The
+dashboard follows the processing slot while a request is in flight, but as soon
+as the server goes idle it falls back to slot 0 — which is a stub unless slot 0
+happened to be the one that ran. The numbers then read zero between requests
+even though the server is healthy and the last request was served fine. Check
+with:
+
+```bash
+curl -s localhost:8080/slots | python3 -c \
+  'import json,sys; [print(s["id"], sorted(k for k in s if k != "params")) for s in json.load(sys.stdin)]'
+```
+
+If only one slot in that listing carries the token keys and it is not slot 0,
+this is what you are hitting. Running the server with `-np 1` avoids it.
+
 ---
 
 ## How it works

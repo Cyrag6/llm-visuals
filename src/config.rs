@@ -120,6 +120,10 @@ pub struct Args {
     /// Seconds between --log-db sample rows
     #[arg(long, default_value_t = 1.0)]
     pub log_every: f64,
+
+    /// Size cap for --log-db in MB; the oldest rows are dropped past it (0 = no cap)
+    #[arg(long, default_value_t = 1024)]
+    pub log_db_max_mb: u64,
 }
 
 impl Args {

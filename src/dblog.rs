@@ -33,7 +33,11 @@ pub struct DbLog {
     every: std::time::Duration,
     /// pid → `PerfTracker::finished` already written.
     logged: HashMap<u32, u64>,
+    /// Cap on live database pages in bytes; 0 = unbounded.
+    max_bytes: u64,
 }
+
+const TABLES: [&str; 3] = ["model_samples", "gpu_samples", "requests"];
 
 fn unix_now() -> f64 {
     SystemTime::now()
@@ -43,7 +47,7 @@ fn unix_now() -> f64 {
 }
 
 impl DbLog {
-    pub fn open(path: &Path, every: std::time::Duration) -> rusqlite::Result<Self> {
+    pub fn open(path: &Path, every: std::time::Duration, max_bytes: u64) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         // WAL lets `sqlite3` read the file while the dashboard is writing.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -53,7 +57,43 @@ impl DbLog {
             last: None,
             every,
             logged: HashMap::new(),
+            max_bytes,
         })
+    }
+
+    /// Bytes held by rows. Pages freed by DELETE are reused by later
+    /// inserts, so keeping this under the cap stops the file growing.
+    fn used_bytes(&self) -> rusqlite::Result<u64> {
+        let q = |p: &str| -> rusqlite::Result<i64> {
+            self.conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get(0))
+        };
+        Ok(((q("page_count")? - q("freelist_count")?) * q("page_size")?).max(0) as u64)
+    }
+
+    /// Drop the oldest tenth of every table until the data fits the cap.
+    // ponytail: runs on the UI loop; a 1 GB trim may stall a frame or two
+    // every few days — move to a background thread if that shows.
+    fn trim(&mut self) -> rusqlite::Result<()> {
+        if self.max_bytes == 0 {
+            return Ok(());
+        }
+        while self.used_bytes()? > self.max_bytes {
+            let mut removed = 0;
+            for t in TABLES {
+                // rowid only grows, so the lowest rowids are the oldest rows.
+                removed += self.conn.execute(
+                    &format!(
+                        "DELETE FROM {t} WHERE rowid IN (SELECT rowid FROM {t} ORDER BY rowid \
+                         LIMIT MAX(1, (SELECT COUNT(*) FROM {t}) / 10))"
+                    ),
+                    [],
+                )?;
+            }
+            if removed == 0 {
+                break; // empty tables: schema alone is over a tiny cap
+            }
+        }
+        Ok(())
     }
 
     /// Call every frame; writes at most once per `every`.
@@ -130,7 +170,8 @@ impl DbLog {
                 ],
             )?;
         }
-        tx.commit()
+        tx.commit()?;
+        self.trim()
     }
 }
 
@@ -144,7 +185,7 @@ mod tests {
     fn logs_samples_and_each_finished_request_once() {
         let path = std::env::temp_dir().join(format!("llm-visuals-dblog-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let mut log = DbLog::open(&path, Duration::ZERO).unwrap();
+        let mut log = DbLog::open(&path, Duration::ZERO, 0).unwrap();
         let model = crate::demo::demo_models(8192, 1).remove(0);
         let mut perf = PerfTracker::new();
         let t0 = Instant::now();
@@ -181,5 +222,32 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, 10);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trims_oldest_rows_to_stay_under_the_cap() {
+        let path = std::env::temp_dir().join(format!("llm-visuals-dbcap-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cap = 64 * 1024;
+        let mut log = DbLog::open(&path, Duration::ZERO, cap).unwrap();
+        let model = crate::demo::demo_models(8192, 1).remove(0);
+        let perf = PerfTracker::new();
+        let gpus = [crate::gpu::DemoGpu::new(0).step(0.5)];
+        let now = Instant::now();
+        for _ in 0..3000 {
+            log.tick(std::iter::once((&model, &perf, 0, 8192)), &gpus, now).unwrap();
+        }
+        assert!(log.used_bytes().unwrap() <= cap);
+        let (min, max): (i64, i64) = log
+            .conn
+            .query_row("SELECT MIN(rowid), MAX(rowid) FROM model_samples", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(max, 3000, "newest row kept");
+        assert!(min > 1, "oldest rows dropped");
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 }

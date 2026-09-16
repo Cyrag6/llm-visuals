@@ -279,6 +279,7 @@ servers cost nothing.
 --max-layers N, --max-heads N     caps for the attention view
 --log-db FILE        append samples and finished requests to a SQLite file
 --log-every 1.0      seconds between --log-db sample rows
+--log-db-max-mb 1024 size cap for --log-db; oldest rows are dropped (0 = none)
 ```
 
 `llm-visuals --help` lists everything.
@@ -287,7 +288,9 @@ With `--log-db`, three tables are written (timestamps are Unix seconds):
 `model_samples` (decode/prefill tok/s, context fill, session totals per model),
 `gpu_samples` (utilisation, VRAM, power, temperature per card) and `requests`
 (one row per finished request: tokens, TTFT, duration, average rates). The file
-uses WAL, so it can be queried while the dashboard runs:
+uses WAL, so it can be queried while the dashboard runs. Once the data passes
+`--log-db-max-mb` (1 GB by default) the oldest tenth of each table is deleted;
+SQLite reuses the freed pages, so the file stops growing at about that size.
 
 ```sh
 sqlite3 llm.db "SELECT model, AVG(avg_decode_tps) FROM requests GROUP BY model"

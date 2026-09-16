@@ -219,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => Some(dblog::DbLog::open(
             path,
             Duration::from_secs_f64(args.log_every.max(0.05)),
+            args.log_db_max_mb * 1024 * 1024,
         )?),
         None => None,
     };

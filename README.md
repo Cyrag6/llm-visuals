@@ -94,12 +94,12 @@ Then, in PowerShell:
 ```powershell
 git clone https://github.com/DingoOz/llm-visuals
 cd llm-visuals
-cargo run --release -- --demo --color truecolor
-cargo run --release -- --color truecolor
+cargo run --release -- --demo
+cargo run --release
 ```
 
-Pass `--color truecolor` in Windows Terminal: it supports 24-bit colour but
-does not set `COLORTERM`, so auto-detection falls back to 256 colours.
+Windows Terminal is detected as truecolor (`WT_SESSION`); in any other
+console, pass `--color truecolor` if colours look flat.
 
 ### What differs from Linux
 
@@ -127,7 +127,7 @@ does not set `COLORTERM`, so auto-detection falls back to 256 colours.
 - [ ] `cargo build --release` completes (MSVC linker and SQLite C build found).
 - [ ] `--demo` renders every view (`a` `p` `h` `m` `b` `v`) and `q` restores
       the terminal.
-- [ ] Colours: auto-detection vs `--color truecolor` in Windows Terminal.
+- [ ] Colours: truecolor is picked automatically in Windows Terminal.
 - [ ] GPU panels show utilisation, VRAM, power and temperature from `nvidia-smi`.
 - [ ] A native `llama-server.exe --metrics` is detected with the right model
       name, port and context size, and throughput updates during a request.

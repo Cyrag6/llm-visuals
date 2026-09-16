@@ -112,6 +112,14 @@ pub struct Args {
     /// Only monitor these PIDs (comma-separated); default is every model found
     #[arg(long, default_value = "all")]
     pub pid: String,
+
+    /// Append model/GPU samples and finished requests to this SQLite file
+    #[arg(long)]
+    pub log_db: Option<PathBuf>,
+
+    /// Seconds between --log-db sample rows
+    #[arg(long, default_value_t = 1.0)]
+    pub log_every: f64,
 }
 
 impl Args {

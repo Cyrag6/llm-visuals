@@ -1,6 +1,7 @@
 mod bandwidth;
 mod colors;
 mod config;
+mod dblog;
 mod host;
 mod demo;
 mod fade;
@@ -212,6 +213,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|n| *n > 0)
         .unwrap_or(args.moe_experts);
     let mut renderer = Renderer::new(theme, args.max_layers, args.max_heads, moe_experts);
+
+    // Opened before raw mode so a bad path fails with a readable error.
+    let mut db = match &args.log_db {
+        Some(path) => Some(dblog::DbLog::open(
+            path,
+            Duration::from_secs_f64(args.log_every.max(0.05)),
+        )?),
+        None => None,
+    };
 
     crossterm::terminal::enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -518,6 +528,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fade_sample_from_live(Some(&slot.model), &latest_gpu, &slot.live, fade::KV_BUCKETS);
             sample.routing = slot.routing.take();
             slot.fade.tick(&sample);
+        }
+
+        if let Some(log) = db.as_mut() {
+            let rows = slots
+                .iter()
+                .map(|s| (&s.model, &s.perf, s.live.ctx_used(), s.ctx_max));
+            if let Err(e) = log.tick(rows, &latest_gpu, now) {
+                // Keep the dashboard up; stop writing and say why.
+                status = format!("--log-db stopped: {e}");
+                db = None;
+            }
         }
 
         focus = focus.min(slots.len().saturating_sub(1));

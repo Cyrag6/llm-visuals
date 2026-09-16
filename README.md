@@ -277,9 +277,21 @@ servers cost nothing.
 --color auto|truecolor|256
 --theme defrag|neon|fire|ocean|monochrome
 --max-layers N, --max-heads N     caps for the attention view
+--log-db FILE        append samples and finished requests to a SQLite file
+--log-every 1.0      seconds between --log-db sample rows
 ```
 
 `llm-visuals --help` lists everything.
+
+With `--log-db`, three tables are written (timestamps are Unix seconds):
+`model_samples` (decode/prefill tok/s, context fill, session totals per model),
+`gpu_samples` (utilisation, VRAM, power, temperature per card) and `requests`
+(one row per finished request: tokens, TTFT, duration, average rates). The file
+uses WAL, so it can be queried while the dashboard runs:
+
+```sh
+sqlite3 llm.db "SELECT model, AVG(avg_decode_tps) FROM requests GROUP BY model"
+```
 
 ---
 

@@ -155,6 +155,8 @@ pub struct PerfTracker {
     pub session_decoded: u64,
     pub session_prefilled: u64,
     pub session_requests: u64,
+    /// Requests pushed to `history` so far; `history` itself is capped.
+    pub finished: u64,
     pub total_power_w: f32,
     pub samples: u64,
     pub poll_ok: bool,
@@ -489,6 +491,7 @@ impl PerfTracker {
             session_decoded: 0,
             session_prefilled: 0,
             session_requests: 0,
+            finished: 0,
             total_power_w: 0.0,
             samples: 0,
             poll_ok: false,
@@ -658,6 +661,7 @@ impl PerfTracker {
             self.history.pop_front();
         }
         self.history.push_back(r);
+        self.finished += 1;
     }
 
     pub fn observe_gpu(&mut self, gpus: &[GpuStats], now: Instant) {

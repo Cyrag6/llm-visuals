@@ -415,6 +415,7 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     parsed
 }
 
+#[cfg(target_os = "linux")]
 fn walk_proc_llms() -> Vec<(u32, String, String)> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
@@ -440,6 +441,7 @@ fn walk_proc_llms() -> Vec<(u32, String, String)> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if raw.is_empty() {
@@ -452,6 +454,48 @@ fn read_cmdline(pid: u32) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+/// No /proc here (Windows, macOS): list processes through sysinfo.
+#[cfg(not(target_os = "linux"))]
+fn walk_proc_llms() -> Vec<(u32, String, String)> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    sys.processes()
+        .iter()
+        .filter_map(|(pid, p)| {
+            let pid = pid.as_u32();
+            let name = p.name().to_string_lossy().into_owned();
+            // Another user's or an elevated process hides its argv; its name
+            // still identifies the engine and the default port.
+            let cmdline = cmdline_of(p).unwrap_or_else(|| name.clone());
+            (looks_like_llm(&name, &cmdline) && !is_self(pid, &cmdline)).then_some((pid, name, cmdline))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cmdline(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    cmdline_of(sys.process(pid)?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmdline_of(p: &sysinfo::Process) -> Option<String> {
+    let args: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    (!args.is_empty()).then(|| args.join(" "))
 }
 
 struct ComputeApp {
@@ -511,10 +555,8 @@ fn nvidia_compute_apps() -> Vec<ComputeApp> {
             Err(_) => continue,
         };
         let process_name = parts[2].trim().to_string();
-        let mem_used = match parts[3].trim().parse::<u64>() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        // Windows (WDDM) reports "[N/A]": keep the process, memory unknown.
+        let mem_used = parts[3].trim().parse::<u64>().unwrap_or(0);
         let gpu_index = uuid_map.get(uuid).copied().unwrap_or(0);
         apps.push(ComputeApp {
             pid,

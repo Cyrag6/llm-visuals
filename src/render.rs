@@ -2001,7 +2001,7 @@ impl Renderer {
             }],
             facts,
             missing: if bw.host_seen && host.disk_read_bytes.is_none() {
-                Some("no /proc/diskstats".into())
+                Some("no disk counters".into())
             } else {
                 None
             },

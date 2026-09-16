@@ -14,6 +14,7 @@ is put together.
 - `--log-db`: model, GPU and per-request history to SQLite.
 - Memory pipeline view (`b`): disk, RAM, PCIe, VRAM, prefill and decode VU
   meters with a bottleneck verdict; bytes per step from the GGUF tensor table.
+- Native Windows: process detection and memory counters via `sysinfo`.
 
 ## Ideas not yet done
 

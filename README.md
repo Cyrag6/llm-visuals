@@ -41,6 +41,16 @@ Requirements: a Rust toolchain (1.75+), `nvidia-smi` on the path for GPU
 panels, and a locally listening `llama-server` for throughput panels. Nothing
 at all is needed for demo mode.
 
+**Windows 11.** The same commands work natively (a Rust MSVC toolchain and
+the NVIDIA driver, which ships `nvidia-smi`). Detection lists processes
+through the OS instead of `/proc`; a server started by another user or as
+administrator hides its command line, so it is matched by name and assumed
+to be on its engine's default port (8080 llama.cpp, 11434 ollama). The
+memory-pipeline view has no system-wide disk, page-cache or page-fault
+counters there, and PCIe traffic needs `nvidia-smi dmon`, which Windows
+drivers may not provide. Under WSL2 it behaves exactly as on Linux, but only
+sees servers running inside WSL.
+
 ```sh
 git clone https://github.com/DingoOz/llm-visuals
 cd llm-visuals

@@ -3,8 +3,9 @@
 //! PCIe traffic per GPU from `nvidia-smi dmon`. Everything is a cumulative
 //! counter or an instantaneous reading; `perf::BandwidthStats` turns them
 //! into rates.
+// The /proc parsers are Linux-only at runtime but stay tested everywhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::path::Path;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -82,15 +83,7 @@ impl HostMonitor {
 
 fn collect(pids: &[u32], want_pcie: bool) -> Vec<(u32, HostSample)> {
     let mut base = HostSample::default();
-    if let Ok(txt) = std::fs::read_to_string("/proc/diskstats") {
-        base.disk_read_bytes = Some(parse_diskstats_read_bytes(&txt));
-    }
-    if let Ok(txt) = std::fs::read_to_string("/proc/meminfo") {
-        let (t, a, c) = parse_meminfo(&txt);
-        base.mem_total_bytes = t;
-        base.mem_available_bytes = a;
-        base.page_cache_bytes = c;
-    }
+    read_system(&mut base);
     if want_pcie {
         if let Some(p) = pcie_throughput() {
             base.pcie_mb_s = p;
@@ -109,7 +102,22 @@ fn collect(pids: &[u32], want_pcie: bool) -> Vec<(u32, HostSample)> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn read_system(base: &mut HostSample) {
+    if let Ok(txt) = std::fs::read_to_string("/proc/diskstats") {
+        base.disk_read_bytes = Some(parse_diskstats_read_bytes(&txt));
+    }
+    if let Ok(txt) = std::fs::read_to_string("/proc/meminfo") {
+        let (t, a, c) = parse_meminfo(&txt);
+        base.mem_total_bytes = t;
+        base.mem_available_bytes = a;
+        base.page_cache_bytes = c;
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read_proc(pid: u32, s: &mut HostSample) {
+    use std::path::Path;
     let dir = format!("/proc/{pid}");
     if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("io")) {
         s.proc_read_bytes = parse_proc_io_read_bytes(&txt);
@@ -120,6 +128,34 @@ fn read_proc(pid: u32, s: &mut HostSample) {
     if let Ok(txt) = std::fs::read_to_string(Path::new(&dir).join("status")) {
         s.rss_file_bytes = status_kb(&txt, "RssFile:");
         s.rss_bytes = status_kb(&txt, "VmRSS:");
+    }
+}
+
+/// No /proc: memory from the OS. System-wide disk reads, page cache, page
+/// faults and file-backed RSS have no portable source and stay unknown.
+#[cfg(not(target_os = "linux"))]
+fn read_system(base: &mut HostSample) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    base.mem_total_bytes = Some(sys.total_memory());
+    base.mem_available_bytes = Some(sys.available_memory());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc(pid: u32, s: &mut HostSample) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory().with_disk_usage(),
+    );
+    if let Some(p) = sys.process(pid) {
+        // Windows counts every read the process made (files, pipes,
+        // sockets), so this runs higher than Linux's storage-only read_bytes.
+        s.proc_read_bytes = Some(p.disk_usage().total_read_bytes);
+        s.rss_bytes = Some(p.memory());
     }
 }
 

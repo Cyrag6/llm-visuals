@@ -23,6 +23,7 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 ## Contents
 
 - [Quick start](#quick-start)
+- [Windows](#windows)
 - [What you see](#what-you-see)
 - [Several models at once](#several-models-at-once)
 - [Keys](#keys)
@@ -41,15 +42,7 @@ Requirements: a Rust toolchain (1.75+), `nvidia-smi` on the path for GPU
 panels, and a locally listening `llama-server` for throughput panels. Nothing
 at all is needed for demo mode.
 
-**Windows 11.** The same commands work natively (a Rust MSVC toolchain and
-the NVIDIA driver, which ships `nvidia-smi`). Detection lists processes
-through the OS instead of `/proc`; a server started by another user or as
-administrator hides its command line, so it is matched by name and assumed
-to be on its engine's default port (8080 llama.cpp, 11434 ollama). The
-memory-pipeline view has no system-wide disk, page-cache or page-fault
-counters there, and PCIe traffic needs `nvidia-smi dmon`, which Windows
-drivers may not provide. Under WSL2 it behaves exactly as on Linux, but only
-sees servers running inside WSL.
+On Windows 11, see [Windows](#windows) for setup.
 
 ```sh
 git clone https://github.com/DingoOz/llm-visuals
@@ -69,6 +62,90 @@ The dashboard auto-detects the server: it lists GPU compute processes, scans
 `/proc` for anything that looks like an inference engine, parses the command
 line for the model path, port, context size and tensor split, and reads the
 GGUF header for the architecture. Press `r` to rescan at any time.
+
+---
+
+## Windows
+
+Windows 11 support is new and has only been type-checked for Windows, not
+run on it yet. The checklist below lists what to test; please report results
+in an issue.
+
+### What to install
+
+1. **Visual Studio Build Tools** with the *Desktop development with C++*
+   workload ([download](https://visualstudio.microsoft.com/visual-cpp-build-tools/)).
+   Rust's default Windows toolchain links with it, and the bundled SQLite used by
+   `--log-db` is compiled with its C compiler.
+2. **Rust** via [rustup](https://rustup.rs) (`rustup-init.exe`), keeping the
+   default `x86_64-pc-windows-msvc` toolchain.
+3. **Git**: [Git for Windows](https://git-scm.com/download/win), or
+   `winget install Git.Git`.
+4. **NVIDIA driver** for GPU panels. Current drivers put `nvidia-smi.exe` in
+   `C:\Windows\System32`; check with `nvidia-smi` in a new terminal.
+5. **Windows Terminal** (preinstalled on Windows 11). The old console host
+   renders the dashboard poorly.
+6. Optional: **Python 3** from python.org with `pip install torch transformers`,
+   only for the `--model <hf-id>` attention view. The dashboard runs `python`
+   on Windows, so it must be on the `PATH`.
+
+Then, in PowerShell:
+
+```powershell
+git clone https://github.com/DingoOz/llm-visuals
+cd llm-visuals
+cargo run --release -- --demo --color truecolor
+cargo run --release -- --color truecolor
+```
+
+Pass `--color truecolor` in Windows Terminal: it supports 24-bit colour but
+does not set `COLORTERM`, so auto-detection falls back to 256 colours.
+
+### What differs from Linux
+
+- **Detection** lists processes through the OS (via the `sysinfo` crate)
+  instead of `/proc`. Run the dashboard as the same user as the server.
+  Windows hides the command line of a process started by another user or as
+  administrator, so that server is matched by name only: it is assumed to be on
+  its engine's default port (8080 for llama.cpp, 11434 for Ollama), and the
+  model name, context size and GGUF details are missing. Starting the
+  dashboard from an administrator terminal should also expose them.
+- **GPU memory per process**: Windows drivers report it as `[N/A]`, so a
+  server shows 0 MB in the model strip. Card-level VRAM is unaffected.
+- **Memory pipeline (`b`)**: RAM totals and the server's resident memory come
+  from the OS. There are no system-wide disk-read, page-cache or page-fault
+  counters, so the DISK stage shows "no disk counters". The per-process read
+  rate counts every read the process makes (files, pipes, sockets), so it runs
+  higher than on Linux. PCIe traffic needs `nvidia-smi dmon`, which Windows
+  drivers may not support; the meter switches itself off after three failures.
+- **Servers in WSL2 or Docker** are not visible to a native Windows build. To
+  watch those, build and run llm-visuals inside WSL2 too; it then behaves
+  exactly as on Linux.
+
+### What to test
+
+- [ ] `cargo build --release` completes (MSVC linker and SQLite C build found).
+- [ ] `--demo` renders every view (`a` `p` `h` `m` `b` `v`) and `q` restores
+      the terminal.
+- [ ] Colours: auto-detection vs `--color truecolor` in Windows Terminal.
+- [ ] GPU panels show utilisation, VRAM, power and temperature from `nvidia-smi`.
+- [ ] A native `llama-server.exe --metrics` is detected with the right model
+      name, port and context size, and throughput updates during a request.
+- [ ] Same server on a non-default `--port`.
+- [ ] The Ollama app (`ollama.exe`, port 11434) is detected.
+- [ ] A server started from an administrator terminal, with the dashboard in
+      a normal one: detected by name on the default port?
+- [ ] `r` rescans after a server is started or stopped; several servers at
+      once show in the model strip.
+- [ ] Memory pipeline: RAM and per-process read rate move while a model
+      loads; whether the PCIe meter works or turns itself off cleanly.
+- [ ] Model paths with spaces (e.g. under `C:\Users\Jane Doe\models`). The
+      command line is split on whitespace, so the path and the GGUF details
+      are likely to be missing.
+- [ ] `--log-db llm.db` writes rows; `--log-db` with a path in a missing
+      folder fails with a readable error.
+- [ ] `--model <hf-id>` starts the Python bridge.
+- [ ] Resizing the window and very small window sizes.
 
 ---
 

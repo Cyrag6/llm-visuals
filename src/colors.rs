@@ -34,8 +34,11 @@ fn detect_truecolor() -> bool {
     if hints.iter().any(|h| term.contains(h) || prog.contains(h)) {
         return true;
     }
-    // gnome-terminal / VTE and Konsole export these and are truecolor-capable.
-    std::env::var("VTE_VERSION").is_ok() || std::env::var("KONSOLE_VERSION").is_ok()
+    // gnome-terminal / VTE, Konsole and Windows Terminal export these and
+    // are truecolor-capable.
+    ["VTE_VERSION", "KONSOLE_VERSION", "WT_SESSION"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok())
 }
 
 /// Build a colour, quantising to the xterm-256 cube when truecolor is off.

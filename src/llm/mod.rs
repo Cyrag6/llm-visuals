@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 
 use crate::pipeline::AttentionWeight;
 
+/// The python.org installer on Windows provides `python`, not `python3`.
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 /// Events emitted by the Python HF bridge (JSONL on stdout)
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -86,7 +89,7 @@ impl PythonBridge {
             ));
         }
 
-        let mut child = Command::new("python3")
+        let mut child = Command::new(PYTHON)
             .arg(&bridge_script)
             .arg("--model")
             .arg(model)
@@ -98,7 +101,7 @@ impl PythonBridge {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("Failed to spawn python3: {e}"))?;
+            .map_err(|e| format!("Failed to spawn {PYTHON}: {e}"))?;
 
         let stdout = child
             .stdout

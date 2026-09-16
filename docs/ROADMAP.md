@@ -20,7 +20,9 @@ is put together.
 - Per-position acceptance rates for deeper MTP drafts (server logs them but
   does not export them).
 - Show the /experts 256-token histogram as a load-balance view per layer.
-- Ollama / vLLM metrics endpoints for throughput on non-llama.cpp servers.
+- Ollama metrics endpoint for throughput (vLLM done — a native `/metrics`
+  adapter reconstructs per-request stats and MTP counters from the
+  engine-wide Prometheus counters).
 - Real DRAM bandwidth (perf uncore counters) instead of the bytes × steps
   estimate; per-GPU memory bandwidth ceilings so the VRAM meter can show GB/s
   against the card's peak.

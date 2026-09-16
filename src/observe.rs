@@ -18,6 +18,43 @@ pub struct LiveStats {
     pub id_task: i64,
     pub n_slots: usize,
     pub slots_busy: usize,
+    /// Speculative positions the serving backend reports (vLLM MTP depth);
+    /// llama.cpp slots don't report this, so it stays 0 there.
+    pub spec_depth: usize,
+
+    /// Server-measured time-to-first-token (seconds) for the request
+    /// whose counters closed in this window. vLLM only: its token and
+    /// latency counters all move at completion, so this stays 0.0 while
+    /// a request is in flight and carries the request's real prefill
+    /// time on the poll that closed it. Always 0.0 on llama.cpp.
+    pub ttft_secs: f64,
+
+    /// Total inter-token time of the requests closed in this window
+    /// (vLLM): vLLM samples one ITL per decode step, so this is each
+    /// request's whole decode span, not a mean gap — the decode rate is
+    /// `(decoded - 1) / itl_sum`. Always 0.0 on llama.cpp.
+    pub itl_sum: f64,
+
+    /// The finishing request's full counters (vLLM). Set on the poll
+    /// where a completion and a successor's admission share one scrape:
+    /// the adapter re-anchors its baselines onto the successor, so
+    /// without this the finished request would look empty and its row
+    /// would be dropped from the request table.
+    pub closing: Option<ClosingRequest>,
+}
+
+/// A vLLM request's full counters against the baseline in effect when it
+/// was admitted — captured on the poll where the adapter re-anchors
+/// onto a successor, so the finished request still gets a table row.
+#[derive(Debug, Clone, Default)]
+pub struct ClosingRequest {
+    pub prompt: usize,
+    pub cached: usize,
+    pub gen: usize,
+    /// Server-measured TTFT (mean over the window's completions).
+    pub ttft_secs: f64,
+    /// Sum of per-request inter-token latencies (see LiveStats).
+    pub itl_sum: f64,
 }
 
 impl LiveStats {
@@ -220,10 +257,15 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         id_task: slot.get("id_task").and_then(|x| x.as_i64()).unwrap_or(-1),
         n_slots,
         slots_busy: busy,
+        spec_depth: 0,
+        // llama.cpp exposes no server-side timing histograms.
+        ttft_secs: 0.0,
+        itl_sum: 0.0,
+        closing: None,
     })
 }
 
-async fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
+pub async fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
     let connect = TcpStream::connect((host, port));
     let mut stream = tokio::time::timeout(Duration::from_millis(400), connect)
         .await

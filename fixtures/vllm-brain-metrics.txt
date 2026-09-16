@@ -1,0 +1,22 @@
+# Trimmed /metrics capture from a vLLM server on an Intel Arc B70
+# (vLLM XPU), reduced to the metric families that src/vllm.rs parses.
+# Values are engine-wide totals at the moment of capture.
+vllm:spec_decode_num_drafts_total{engine="0",model_name="qwen38"} 62827.0
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="qwen38"} 251307.0
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="qwen38"} 124550.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen38",position="0"} 45806.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen38",position="1"} 33653.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen38",position="2"} 25357.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen38",position="3"} 19734.0
+vllm:num_requests_running{engine="0",model_name="qwen38"} 0.0
+vllm:prompt_tokens_total{engine="0",model_name="qwen38"} 4.610744e+06
+vllm:prompt_tokens_cached_total{engine="0",model_name="qwen38"} 0.0
+vllm:generation_tokens_total{engine="0",model_name="qwen38"} 187311.0
+vllm:request_success_total{engine="0",finished_reason="stop",model_name="qwen38"} 85.0
+vllm:request_success_total{engine="0",finished_reason="length",model_name="qwen38"} 0.0
+vllm:request_success_total{engine="0",finished_reason="abort",model_name="qwen38"} 0.0
+vllm:request_success_total{engine="0",finished_reason="error",model_name="qwen38"} 0.0
+vllm:request_success_total{engine="0",finished_reason="repetition",model_name="qwen38"} 0.0
+vllm:time_to_first_token_seconds_count{engine="0",model_name="qwen38"} 86.0
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="qwen38"} 4332.008803606033
+vllm:inter_token_latency_seconds_sum{engine="0",model_name="qwen38"} 4553.507536520017

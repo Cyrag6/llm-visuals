@@ -10,6 +10,7 @@ mod gpu;
 mod llm;
 mod model_detect;
 mod observe;
+mod vllm;
 mod perf;
 mod pipeline;
 mod render;
@@ -113,27 +114,75 @@ fn spawn_pollers(
     spec_tx: &mpsc::Sender<(u32, SpecMetrics)>,
     experts_tx: &mpsc::Sender<(u32, ExpertStats)>,
     poll: Duration,
-) -> Vec<JoinHandle<()>> {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    // Cross-wiring guard input: every other detected model's (name, port)
+    // pair, so a vLLM slot can reject samples whose model_name label
+    // belongs to a different model on the same port.
+    let others: Vec<(String, u16)> = models
+        .iter()
+        .filter_map(|m| m.port.map(|p| (m.name.clone(), p)))
+        .collect();
     models
         .iter()
-        .filter_map(|m| m.port.map(|port| (m.key(), port)))
-        .map(|(pid, port)| {
+        .filter_map(|m| m.port.map(|port| (m.clone(), port)))
+        .map(|(m, port)| {
             let live_tx = live_tx.clone();
             let spec_tx = spec_tx.clone();
             let experts_tx = experts_tx.clone();
-            tokio::spawn(async move { poll_server(pid, port, live_tx, spec_tx, experts_tx, poll).await })
+            let others = others.clone();
+            tokio::spawn(async move {
+                poll_server(m, port, live_tx, spec_tx, experts_tx, others, poll).await
+            })
         })
         .collect()
 }
 
 async fn poll_server(
-    pid: u32,
+    model: DetectedModel,
     port: u16,
     live_tx: mpsc::Sender<(u32, LiveStats)>,
     spec_tx: mpsc::Sender<(u32, SpecMetrics)>,
     experts_tx: mpsc::Sender<(u32, ExpertStats)>,
+    others: Vec<(String, u16)>,
     poll: Duration,
 ) {
+    let pid = model.key();
+    if model.engine == "vllm" {
+        // vLLM has no /slots or /experts endpoints; its /metrics counters
+        // drive the live stats and the MTP panel. The 'r' rescan drops
+        // dead processes (same policy as the llama.cpp path); until then a
+        // failing scrape — dead port, or the cross-wiring guard rejecting
+        // another model's counters — decays the slot to idle and backs
+        // off, instead of freezing the UI mid-request at full poll rate.
+        let mut adapter = vllm::VllmAdapter::new();
+        let mut misses = 0u32;
+        loop {
+            if let Some(c) = vllm::poll_vllm(port, &model.name, &others).await {
+                misses = 0;
+                let (mut stats, spec) = adapter.observe(&c);
+                stats.ctx_max = model.ctx_max.unwrap_or(0);
+                let _ = live_tx.try_send((model.key(), stats));
+                if let Some(m) = spec {
+                    let _ = spec_tx.try_send((model.key(), m));
+                }
+            } else {
+                misses = misses.saturating_add(1);
+                if misses == 3 {
+                    let stats = LiveStats {
+                        ctx_max: model.ctx_max.unwrap_or(0),
+                        ..Default::default()
+                    };
+                    let _ = live_tx.try_send((model.key(), stats));
+                }
+            }
+            let delay = if misses >= 3 {
+                poll.max(Duration::from_secs(2))
+            } else {
+                poll
+            };
+            tokio::time::sleep(delay).await;
+        }
+    }
     let mut metrics_ok = true;
     let mut metrics_misses = 0u32;
     let mut experts_ok = true;

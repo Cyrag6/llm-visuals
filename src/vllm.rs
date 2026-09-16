@@ -26,7 +26,8 @@
 //! a containerized vLLM instance published to a port another local server
 //! already owns would otherwise feed this slot the other model's counters
 //! (both "listen" on the same port from the host's point of view).
-//! Without the guard such a slot is marked unreachable instead of lying.
+//! With the guard such a slot's samples are rejected and the poll loop
+//! decays it to idle instead of lying.
 
 use crate::observe::{http_get, ClosingRequest, LiveStats, SpecMetrics};
 
@@ -149,22 +150,26 @@ pub async fn poll_vllm(
 ) -> Option<VllmCounters> {
     let body = http_get("127.0.0.1", port, "/metrics").await.ok()?;
     let c = parse_vllm_metrics(&body)?;
-
-    if let Some(label) = &c.model_name {
-        if label != expected_name {
-            let cross_wired = other_models.iter().any(|(name, p)| {
-                *p == port
-                    && name != expected_name
-                    && name.len() >= 4
-                    && (label == name || label.starts_with(name) || name.starts_with(label))
-            });
-            if cross_wired {
-                return None;
-            }
-        }
+    if c.model_name
+        .as_deref()
+        .is_some_and(|label| cross_wired(label, expected_name, port, other_models))
+    {
+        return None;
     }
-
     Some(c)
+}
+
+/// Whether a `model_name` label that disagrees with the expected name is
+/// evidence of a container port-publish collision: another detected model
+/// claims the same port and the label matches *its* name.
+fn cross_wired(label: &str, expected: &str, port: u16, others: &[(String, u16)]) -> bool {
+    label != expected
+        && others.iter().any(|(name, p)| {
+            *p == port
+                && name != expected
+                && name.len() >= 4
+                && (label == name || label.starts_with(name.as_str()) || name.starts_with(label))
+        })
 }
 
 /// Per-slot reconstruction state: counter baselines + the synthetic task
@@ -436,36 +441,11 @@ mod tests {
         let c = parse_vllm_metrics(body).unwrap();
         assert_eq!(c.model_name.as_deref(), Some("qwen38"));
         let others = vec![("qwen38".to_string(), 8000u16)];
-        assert!(poll_guard("model", 8000, &others, &c).is_none());
+        let label = c.model_name.as_deref().unwrap();
+        assert!(cross_wired(label, "model", 8000, &others));
         // Same port, unrelated names: no cross-wiring evidence, accept.
-        assert!(poll_guard("model", 8001, &others, &c).is_some());
+        assert!(!cross_wired(label, "model", 8001, &others));
         // Matching name: accept.
-        assert!(poll_guard("qwen38", 8000, &others, &c).is_some());
-    }
-
-    /// The guard logic split out of poll_vllm so it is testable without a
-    /// live server.
-    fn poll_guard<'a>(
-        expected_name: &'a str,
-        port: u16,
-        other_models: &'a [(String, u16)],
-        c: &'a VllmCounters,
-    ) -> Option<&'a VllmCounters> {
-        if let Some(label) = &c.model_name {
-            if label != expected_name {
-                let cross_wired = other_models.iter().any(|(name, p)| {
-                    *p == port
-                        && name != expected_name
-                        && name.len() >= 4
-                        && (label == name
-                            || label.starts_with(name)
-                            || name.starts_with(label))
-                });
-                if cross_wired {
-                    return None;
-                }
-            }
-        }
-        Some(c)
+        assert!(!cross_wired(label, "qwen38", 8000, &others));
     }
 }

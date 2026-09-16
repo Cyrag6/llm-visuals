@@ -633,11 +633,13 @@ impl PerfTracker {
                         if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                             done.started = st;
                         }
-                        done.ended = Some(now);
                     }
-                } else {
-                    done.ended = Some(now);
                 }
+                // Unconditional: only the backdate is gated on a usable
+                // TTFT — a record without one must still stop being
+                // "live" or its row pulses with a growing duration
+                // forever.
+                done.ended = Some(now);
                 self.finish(done);
             }
             self.current = Some(RequestRecord::new(s.id_task, now, s));
@@ -684,6 +686,15 @@ impl PerfTracker {
         if !s.processing && s.ttft_secs > 0.0 && d_pre > 0 {
             self.prefill_tps =
                 self.prefill_tps.max(d_pre as f32 / s.ttft_secs as f32);
+        }
+        // Same for decode: vLLM's generation counter moves only on the
+        // completion poll — which is exactly when the window above was
+        // cleared — so use the measured ITL sum (one sample per decode
+        // step, i.e. decoded - 1 of them).
+        if !s.processing && s.itl_sum > 0.0 && d_dec > 1 {
+            self.decode_tps = self
+                .decode_tps
+                .max((d_dec - 1) as f32 / s.itl_sum as f32);
         }
         let ema = |prev: f32, x: f32, up: f32, down: f32| -> f32 {
             let a = if x > prev { up } else { down };
@@ -920,6 +931,9 @@ mod tests {
         // The graph spike is bounded by the same measurement, not by
         // one poll interval (which would say 5000 tok/s here).
         assert!((p.peak_prefill_tps - 500.0).abs() < 1.0, "{}", p.peak_prefill_tps);
+        // Decode likewise: the completion poll is the only one where the
+        // counter moves, so without the ITL clamp this would read 0.
+        assert!((p.peak_decode_tps - 39.0 / 0.05).abs() < 1.0, "{}", p.peak_decode_tps);
     }
 
     #[test]
@@ -968,6 +982,30 @@ mod tests {
         assert_eq!(p.session_prefilled, 950, "900 (A) + 50 (B)");
         assert_eq!(p.session_decoded, 60);
         assert_eq!(p.history.len(), 2);
+    }
+
+    #[test]
+    fn rescued_request_without_ttft_is_still_closed() {
+        // A closing view with no usable TTFT (aborted request, or a
+        // build without the histogram) must still stamp `ended`, or the
+        // row stays "live" forever.
+        let mut p = PerfTracker::new();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(200);
+        p.observe(&slot(1, false, 0, 0, 0), t0);
+        p.observe(&vllm_slot(5, true, 0, 0, 0, 0.0, 0.0, None), t0 + step);
+        p.observe(
+            &vllm_slot(6, true, 0, 0, 0, 0.0, 0.0, Some(crate::observe::ClosingRequest {
+                prompt: 100,
+                cached: 0,
+                gen: 10,
+                ttft_secs: 0.0,
+                itl_sum: 0.0,
+            })),
+            t0 + step * 2,
+        );
+        let a = p.history.iter().find(|r| r.id_task == 5).expect("row kept");
+        assert!(a.ended.is_some(), "rescued row must not stay live");
     }
 
     #[test]

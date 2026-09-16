@@ -154,6 +154,22 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Context length from a HuggingFace-style weights dir's config.json
+/// ("max_position_embeddings": N). String scan instead of a JSON
+/// dependency — the key is unique and the value is a bare integer.
+fn hf_config_ctx(dir: &Path) -> Option<usize> {
+    let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let i = txt.find("\"max_position_embeddings\"")?;
+    let rest = &txt[i..];
+    let colon = rest.find(':')?;
+    let digits: String = rest[colon + 1..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 /// Whether a process that `looks_like_llm` flagged as vLLM is actually a
 /// vLLM helper rather than the server itself. The main process forks
 /// named workers (`VLLM::EngineCore`, `VLLM::Worker_TPn`) that inherit
@@ -166,7 +182,16 @@ fn is_vllm_phantom(process_name: &str, cmdline: &str) -> bool {
     if process_name.starts_with("VLLM::") || process_name.starts_with("docker") {
         return true;
     }
-    process_name != "vllm" && !cmdline.contains("--port")
+    // The real server is the `vllm` launcher or the python module form,
+    // whatever its comm says (python3, pt_main_thread, or a full
+    // executable path on the nvidia-smi side). Wrapper scripts and
+    // clients merely mention vllm somewhere in their arguments.
+    let argv0_is_vllm = cmdline
+        .split_whitespace()
+        .next()
+        .map(|t| Path::new(t).file_name().is_some_and(|f| f == "vllm"))
+        .unwrap_or(false);
+    !(argv0_is_vllm || cmdline.contains("vllm.entrypoints"))
 }
 
 /// A vLLM server in a Docker container reports its container-internal
@@ -220,6 +245,7 @@ fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
             _ => continue,
         };
         let mut container_ip: Option<String> = None;
+        let mut container_port: Option<u16> = None;
         let mut host_port: Option<u16> = None;
         let mut i = 0;
         while i < args.len() {
@@ -227,6 +253,12 @@ fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
                 "-container-ip" => {
                     if let Some(v) = args.get(i + 1) {
                         container_ip = Some(v.clone());
+                        i += 1;
+                    }
+                }
+                "-container-port" => {
+                    if let Some(v) = args.get(i + 1) {
+                        container_port = v.parse().ok();
                         i += 1;
                     }
                 }
@@ -240,8 +272,13 @@ fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
             }
             i += 1;
         }
+        // A container can publish several ports (one docker-proxy each,
+        // all sharing the container IP); only the mapping whose container
+        // side is the server's own port is ours.
         if let (Some(ip), Some(port)) = (&container_ip, host_port) {
-            if ips.iter().any(|x| x == ip) {
+            if ips.iter().any(|x| x == ip)
+                && container_port == Some(cmdline_port.unwrap_or(8000))
+            {
                 return Some(port);
             }
         }
@@ -402,6 +439,11 @@ pub fn detect_models() -> Vec<DetectedModel> {
                     m.gguf = Some(info);
                     m.tensors = gguf::read_tensor_summary(&path).ok();
                 }
+            } else if m.ctx_max.is_none() && path.is_dir() {
+                // A safetensors dir has no GGUF ctx_train; vLLM's default
+                // --max-model-len is the config's max_position_embeddings,
+                // so that is the served context when the flag is absent.
+                m.ctx_max = hf_config_ctx(&path);
             }
         }
         m.gpu_indices.sort_unstable();
@@ -554,6 +596,10 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     };
 
     let mut i = 0;
+    // Only tokens after `serve` / `api-server` can be vLLM's positional
+    // weights path; without this the catch-all below eats argv[0] (the
+    // launcher binary's own path) or a stray flag value.
+    let mut seen_serve = false;
     while i < tokens.len() {
         let t = tokens[i];
         let (key, inline) = if let Some((k, v)) = t.split_once('=') {
@@ -626,8 +672,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
             }
             // vLLM takes the weights path positionally after `serve` /
             // `api-server`; there is no --model key to capture it.
-            "serve" | "api-server" if parsed.engine == "vllm" && parsed.path.is_none() => {
-                if let Some(v) = next() {
+            "serve" | "api-server" if parsed.engine == "vllm" => {
+                seen_serve = true;
+                if let Some(v) = next().filter(|_| parsed.path.is_none()) {
                     if !v.starts_with('-') {
                         let p = PathBuf::from(&v);
                         if parsed.name.is_empty() {
@@ -672,9 +719,18 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
             }
             // vLLM also takes the weights path as a bare positional even
             // later in the argument list; the named arms above only catch
-            // the direct `serve <path>` form.
-            _ if parsed.engine == "vllm" && !key.starts_with('-') && parsed.path.is_none() => {
-                if key != "vllm" {
+            // the direct `serve <path>` form. Require a path-shaped token
+            // (a '/' or a weights extension) so bare values of unhandled
+            // flags ("--dtype float16") are not mistaken for the model.
+            _ if parsed.engine == "vllm"
+                && seen_serve
+                && !key.starts_with('-')
+                && parsed.path.is_none()
+                && (key.contains('/')
+                    || key.ends_with(".gguf")
+                    || key.ends_with(".safetensors")) =>
+            {
+                {
                     let p = PathBuf::from(&key);
                     if parsed.name.is_empty() {
                         parsed.name = p
@@ -882,6 +938,52 @@ mod tests {
             "docker run --rm --name steve image vllm serve /model --port 8000"
         ));
         assert!(is_vllm_phantom("bash", "bash /home/seth/epyc/vllm-b70/run_vllm.sh"));
+        // The comm is rarely the literal "vllm": python entrypoints and
+        // renamed mains are still the real server.
+        assert!(!is_vllm_phantom(
+            "python3",
+            "/usr/bin/python3 -m vllm.entrypoints.openai.api_server --model /m"
+        ));
+        assert!(!is_vllm_phantom("pt_main_thread", "/opt/venv/bin/vllm serve /model"));
+        // nvidia-smi reports the executable path, not the comm.
+        assert!(!is_vllm_phantom("/opt/venv/bin/vllm", "/opt/venv/bin/vllm serve /model"));
+    }
+
+    #[test]
+    fn parse_vllm_serve_cmdline() {
+        // argv[0] is a full path that must not be taken for the weights.
+        let p = parse_cmdline(
+            "vllm",
+            "/opt/venv/bin/vllm serve /models/brain --port 8003 --max-model-len 40960 --served-model-name brain",
+        );
+        assert_eq!(p.engine, "vllm");
+        assert_eq!(p.name, "brain");
+        assert_eq!(p.path.as_deref(), Some(Path::new("/models/brain")));
+        assert_eq!(p.port, Some(8003));
+        assert_eq!(p.ctx_max, Some(40960));
+
+        // Positional after unhandled flags: the flag's bare value must not
+        // be taken for the weights either.
+        let p = parse_cmdline("vllm", "/opt/venv/bin/vllm serve --dtype float16 /models/qwen");
+        assert_eq!(p.path.as_deref(), Some(Path::new("/models/qwen")));
+        assert_eq!(p.name, "qwen");
+
+        // HuggingFace id as the positional.
+        let p = parse_cmdline("vllm", "/opt/venv/bin/vllm serve Qwen/Qwen3-8B");
+        assert_eq!(p.path.as_deref(), Some(Path::new("Qwen/Qwen3-8B")));
+    }
+
+    #[test]
+    fn hf_config_ctx_reads_max_position_embeddings() {
+        let dir = std::env::temp_dir().join("llm-visuals-test-hfcfg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            "{\n  \"model_type\": \"qwen3\",\n  \"max_position_embeddings\": 40960,\n  \"vocab_size\": 151936\n}\n",
+        )
+        .unwrap();
+        assert_eq!(hf_config_ctx(&dir), Some(40960));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

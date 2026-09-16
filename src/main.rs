@@ -148,20 +148,38 @@ async fn poll_server(
     let pid = model.key();
     if model.engine == "vllm" {
         // vLLM has no /slots or /experts endpoints; its /metrics counters
-        // drive the live stats and the MTP panel. A dead port simply stops
-        // updating this slot — the 'r' rescan drops dead processes (same
-        // policy as the llama.cpp path).
+        // drive the live stats and the MTP panel. The 'r' rescan drops
+        // dead processes (same policy as the llama.cpp path); until then a
+        // failing scrape — dead port, or the cross-wiring guard rejecting
+        // another model's counters — decays the slot to idle and backs
+        // off, instead of freezing the UI mid-request at full poll rate.
         let mut adapter = vllm::VllmAdapter::new();
+        let mut misses = 0u32;
         loop {
             if let Some(c) = vllm::poll_vllm(port, &model.name, &others).await {
+                misses = 0;
                 let (mut stats, spec) = adapter.observe(&c);
                 stats.ctx_max = model.ctx_max.unwrap_or(0);
                 let _ = live_tx.try_send((model.key(), stats));
                 if let Some(m) = spec {
                     let _ = spec_tx.try_send((model.key(), m));
                 }
+            } else {
+                misses = misses.saturating_add(1);
+                if misses == 3 {
+                    let stats = LiveStats {
+                        ctx_max: model.ctx_max.unwrap_or(0),
+                        ..Default::default()
+                    };
+                    let _ = live_tx.try_send((model.key(), stats));
+                }
             }
-            tokio::time::sleep(poll).await;
+            let delay = if misses >= 3 {
+                poll.max(Duration::from_secs(2))
+            } else {
+                poll
+            };
+            tokio::time::sleep(delay).await;
         }
     }
     let mut metrics_ok = true;

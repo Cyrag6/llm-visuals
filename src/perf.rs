@@ -17,6 +17,14 @@ pub struct RequestRecord {
     pub id_task: i64,
     pub started: Instant,
     pub first_token: Option<Instant>,
+    /// Server-measured TTFT in seconds (vLLM histogram). None on
+    /// llama.cpp, where the first decoded token's poll is the clock.
+    /// Wins over `first_token` wherever a TTFT is shown or divided by.
+    pub ttft: Option<f32>,
+    /// The request's TOTAL inter-token latency as measured by the server
+    /// (vLLM): one ITL sample per decode step — the whole decode span, so
+    /// the decode rate is `(decoded - 1) / itl_sum`.
+    pub itl_sum: Option<f32>,
     pub ended: Option<Instant>,
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
@@ -34,6 +42,8 @@ impl RequestRecord {
             id_task,
             started: now,
             first_token: None,
+            ttft: None,
+            itl_sum: None,
             ended: None,
             prompt_tokens: s.prompt_tokens,
             cached_tokens: s.cache_tokens,
@@ -45,7 +55,14 @@ impl RequestRecord {
         }
     }
 
+    /// Time to first token. The server-measured TTFT (vLLM) wins:
+    /// with that counter set the first token is only observed on the
+    /// completion poll, so a first_token - started span would include
+    /// the whole decode phase. llama.cpp keeps the poll-estimated one.
     pub fn ttft(&self) -> Option<Duration> {
+        if let Some(secs) = self.ttft {
+            return Some(Duration::from_secs_f64(secs as f64));
+        }
         self.first_token.map(|t| t - self.started)
     }
 
@@ -54,6 +71,17 @@ impl RequestRecord {
     }
 
     pub fn avg_decode_tps(&self) -> f32 {
+        // The server-measured decode span (vLLM ITL histogram) wins
+        // over the poll-interval sum, which only counts the polls that
+        // happened to carry a new token.
+        if let Some(itl) = self.itl_sum {
+            if self.decoded > 1 && itl > 0.0 {
+                // itl_sum is the request's TOTAL inter-token time
+                // (vLLM observes one sample per decode step); the
+                // request produced (decoded - 1) gaps.
+                return (self.decoded - 1) as f32 / itl;
+            }
+        }
         if self.decode_secs > 0.05 {
             self.decoded as f32 / self.decode_secs
         } else {
@@ -62,6 +90,14 @@ impl RequestRecord {
     }
 
     pub fn avg_prefill_tps(&self) -> f32 {
+        // The server-measured TTFT (vLLM) is the true prefill duration
+        // — total prefill tokens divided by TTFT. Without it
+        // (llama.cpp) fall back to the poll-interval sum.
+        if let Some(ttft) = self.ttft {
+            if ttft > 0.0 {
+                return self.prefill_tokens as f32 / ttft;
+            }
+        }
         if self.prefill_secs > 0.05 {
             self.prefill_tokens as f32 / self.prefill_secs
         } else {
@@ -565,6 +601,47 @@ impl PerfTracker {
             || (s.processing && s.decoded < prev.decoded);
         if new_request && s.processing {
             if let Some(mut done) = self.current.take() {
+                // vLLM moves its counters only at completion, so when a
+                // completion and a successor's admission share one poll
+                // the record above was starved of the finished request's
+                // counters — restore them from the closing view the
+                // adapter captured before re-anchoring.
+                if let Some(close) = s.closing.as_ref() {
+                    if done.prefill_tokens == 0 && done.decoded == 0 {
+                        done.prompt_tokens = close.prompt;
+                        done.cached_tokens = close.cached;
+                        done.prefill_tokens =
+                            close.prompt.saturating_sub(close.cached);
+                        done.decoded = close.gen;
+                        if close.ttft_secs > 0.0 {
+                            done.ttft = Some(close.ttft_secs as f32);
+                        }
+                        if close.itl_sum > 0.0 {
+                            done.itl_sum = Some(close.itl_sum as f32);
+                        }
+                        // The closing poll re-anchored the baselines,
+                        // so its deltas were 0 — bill the rescued
+                        // counters to the session totals explicitly.
+                        self.session_prefilled += done.prefill_tokens as u64;
+                        self.session_decoded += done.decoded as u64;
+                    }
+                    // The detection stamps can lag a busy server
+                    // (vLLM's /metrics handler only answers between
+                    // event-loop work), so backdate `started` to the
+                    // server's own timeline: TTFT + total inter-token
+                    // time spans admission -> last token. `ended`
+                    // keeps the detection time.
+                    if done.ttft.map_or(false, |t| t > 0.0) {
+                        let e2e = close.ttft_secs + close.itl_sum;
+                        if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
+                            done.started = st;
+                        }
+                    }
+                }
+                // Unconditional: only the backdate is gated on a usable
+                // TTFT — a record without one must still stop being
+                // "live" or its row pulses with a growing duration
+                // forever.
                 done.ended = Some(now);
                 self.finish(done);
             }
@@ -605,6 +682,23 @@ impl PerfTracker {
         }
         self.decode_tps = self.decode_win.rate(now);
         self.prefill_tps = self.prefill_win.rate(now);
+        // vLLM reports token deltas only at completion, so the windowed
+        // prefill rate would divide the whole prompt by one poll
+        // interval. When a request closes in this window, use its
+        // measured TTFT as the denominator instead (tokens / TTFT).
+        if !s.processing && s.ttft_secs > 0.0 && d_pre > 0 {
+            self.prefill_tps =
+                self.prefill_tps.max(d_pre as f32 / s.ttft_secs as f32);
+        }
+        // Same for decode: vLLM's generation counter moves only on the
+        // completion poll — which is exactly when the window above was
+        // cleared — so use the measured ITL sum (one sample per decode
+        // step, i.e. decoded - 1 of them).
+        if !s.processing && s.itl_sum > 0.0 && d_dec > 1 {
+            self.decode_tps = self
+                .decode_tps
+                .max((d_dec - 1) as f32 / s.itl_sum as f32);
+        }
         let ema = |prev: f32, x: f32, up: f32, down: f32| -> f32 {
             let a = if x > prev { up } else { down };
             prev + (x - prev) * a
@@ -643,9 +737,29 @@ impl PerfTracker {
                     cur.first_token = Some(now);
                 }
             }
+            // Server-measured timings (vLLM): the poll that closed a
+            // request carries its whole TTFT / ITL lifetime in one
+            // delta; stamp it onto the record.
+            if s.ttft_secs > 0.0 {
+                cur.ttft = Some(s.ttft_secs as f32);
+            }
+            if s.itl_sum > 0.0 {
+                cur.itl_sum = Some(s.itl_sum as f32);
+            }
             if !s.processing {
                 let mut done = self.current.take().unwrap();
                 done.ended = Some(now);
+                // Same backdate as the closing path: vLLM's TTFT +
+                // total inter-token time is the request's true wall
+                // span (admission -> last token). llama.cpp rows have
+                // no histograms and keep the detection-based span.
+                if done.ttft.map_or(false, |t| t > 0.0) {
+                    let e2e = done.ttft.unwrap() as f64
+                        + done.itl_sum.unwrap_or(0.0) as f64;
+                    if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
+                        done.started = st;
+                    }
+                }
                 self.finish(done);
             }
         }
@@ -761,6 +875,141 @@ mod tests {
         assert!(r.avg_decode_tps() > 40.0);
         assert_eq!(p.session_decoded, 20);
         assert_eq!(p.session_requests, 1);
+        // llama.cpp exposes no server timings: the poll-based rates
+        // remain the source of truth.
+        assert!(r.ttft.is_none());
+        assert!(r.itl_sum.is_none());
+    }
+
+    /// vLLM-shaped slot: counters jump only at completion; the
+    /// optional `closing` view is what the adapter hands over when a
+    /// completion and a successor's admission share one poll.
+    fn vllm_slot(
+        id: i64,
+        processing: bool,
+        prompt: usize,
+        processed: usize,
+        decoded: usize,
+        ttft: f64,
+        itl: f64,
+        closing: Option<crate::observe::ClosingRequest>,
+    ) -> LiveStats {
+        LiveStats {
+            ctx_max: 4096,
+            prompt_tokens: prompt,
+            prompt_processed: processed,
+            decoded,
+            processing,
+            id_task: id,
+            ttft_secs: ttft,
+            itl_sum: itl,
+            closing,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vllm_completion_reports_server_measured_rates() {
+        let mut p = PerfTracker::new();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(200);
+        p.observe(&slot(1, false, 0, 0, 0), t0);
+        // Admission: vLLM moves none of its counters while the request
+        // is in flight.
+        p.observe(&vllm_slot(2, true, 0, 0, 0, 0.0, 0.0, None), t0 + step);
+        assert!(p.prefill_tps < 1.0, "{}", p.prefill_tps);
+        // Completion 17 s later: 1000 prompt tokens, 40 generated,
+        // 2.0 s TTFT, 0.05 s total inter-token time.
+        p.observe(
+            &vllm_slot(2, false, 1000, 1000, 40, 2.0, 0.05, None),
+            t0 + step + Duration::from_secs(17),
+        );
+        let r = p.history.back().expect("finished request");
+        assert_eq!(r.prefill_tokens, 1000);
+        // The user's formula: total prefill tokens / TTFT.
+        assert!((r.avg_prefill_tps() - 500.0).abs() < 1.0, "{}", r.avg_prefill_tps());
+        assert!((r.ttft().map(|d| d.as_secs_f64()).unwrap() - 2.0).abs() < 1e-6);
+        // Decode: 39 inter-token gaps over the server-measured
+        // span (itl_sum = 0.05 s total).
+        assert!((r.avg_decode_tps() - 39.0 / 0.05).abs() < 1.0, "{}", r.avg_decode_tps());
+        // The graph spike is bounded by the same measurement, not by
+        // one poll interval (which would say 5000 tok/s here).
+        assert!((p.peak_prefill_tps - 500.0).abs() < 1.0, "{}", p.peak_prefill_tps);
+        // Decode likewise: the completion poll is the only one where the
+        // counter moves, so without the ITL clamp this would read 0.
+        assert!((p.peak_decode_tps - 39.0 / 0.05).abs() < 1.0, "{}", p.peak_decode_tps);
+    }
+
+    #[test]
+    fn closing_view_rescues_request_row_on_chained_completion() {
+        let mut p = PerfTracker::new();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(200);
+        p.observe(&slot(1, false, 0, 0, 0), t0);
+        p.observe(&vllm_slot(5, true, 0, 0, 0, 0.0, 0.0, None), t0 + step);
+        // A (task 5: 1000 prompt / 100 cached / 40 generated / 2.0 s
+        // TTFT / 0.05 s ITL total) closes and B (task 6) is admitted in
+        // the same poll. The baseline re-anchors onto B, so the closing
+        // view is the only place A's counters survive.
+        p.observe(
+            &vllm_slot(6, true, 0, 0, 0, 0.0, 0.0, Some(crate::observe::ClosingRequest {
+                prompt: 1000,
+                cached: 100,
+                gen: 40,
+                ttft_secs: 2.0,
+                itl_sum: 0.05,
+            })),
+            t0 + step + Duration::from_secs(17),
+        );
+        // A's row exists and is complete despite the re-anchor.
+        let a = p
+            .history
+            .iter()
+            .rev()
+            .find(|r| r.id_task == 5)
+            .expect("the finished request keeps a row");
+        assert_eq!(a.prefill_tokens, 900, "prompt minus cache");
+        assert_eq!(a.decoded, 40);
+        assert!((a.avg_prefill_tps() - 450.0).abs() < 1.0, "{}", a.avg_prefill_tps());
+        assert!((a.avg_decode_tps() - 39.0 / 0.05).abs() < 1.0);
+        // B is measured against the re-anchored baseline.
+        p.observe(&vllm_slot(6, false, 50, 50, 20, 0.5, 0.1, None), t0 + step * 2 + Duration::from_secs(17));
+        let b = p
+            .history
+            .iter()
+            .rev()
+            .find(|r| r.id_task == 6)
+            .expect("B's row");
+        assert_eq!(b.prefill_tokens, 50);
+        assert_eq!(b.decoded, 20);
+        assert!((b.avg_prefill_tps() - 100.0).abs() < 1.0, "50 / 0.5 s", );
+        assert_eq!(p.session_prefilled, 950, "900 (A) + 50 (B)");
+        assert_eq!(p.session_decoded, 60);
+        assert_eq!(p.history.len(), 2);
+    }
+
+    #[test]
+    fn rescued_request_without_ttft_is_still_closed() {
+        // A closing view with no usable TTFT (aborted request, or a
+        // build without the histogram) must still stamp `ended`, or the
+        // row stays "live" forever.
+        let mut p = PerfTracker::new();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(200);
+        p.observe(&slot(1, false, 0, 0, 0), t0);
+        p.observe(&vllm_slot(5, true, 0, 0, 0, 0.0, 0.0, None), t0 + step);
+        p.observe(
+            &vllm_slot(6, true, 0, 0, 0, 0.0, 0.0, Some(crate::observe::ClosingRequest {
+                prompt: 100,
+                cached: 0,
+                gen: 10,
+                ttft_secs: 0.0,
+                itl_sum: 0.0,
+            })),
+            t0 + step * 2,
+        );
+        let a = p.history.iter().find(|r| r.id_task == 5).expect("row kept");
+        assert!(a.ended.is_some(), "rescued row must not stay live");
     }
 
     #[test]

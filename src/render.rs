@@ -900,7 +900,7 @@ impl Renderer {
             .detected
             .and_then(|m| m.gguf.as_ref())
             .map(|g| g.n_mtp)
-            .unwrap_or(0);
+            .unwrap_or(d.live.spec_depth);
         let enabled = !spec_type.is_empty() && spec_type != "none";
         let title = if !enabled {
             " ◆ MTP  no speculative decoding ".to_string()

@@ -51,6 +51,9 @@ impl DbLog {
         let conn = Connection::open(path)?;
         // WAL lets `sqlite3` read the file while the dashboard is writing.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Every dashboard shares the default file; wait briefly for another
+        // one's commit instead of failing and switching logging off.
+        conn.busy_timeout(std::time::Duration::from_millis(100))?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn,

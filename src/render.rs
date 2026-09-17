@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
 
@@ -19,6 +19,7 @@ use crate::model_detect::DetectedModel;
 use crate::observe::{ExpertStats, LiveStats};
 use crate::perf::{Meter, PerfTracker, Phase, RequestRecord};
 use crate::pipeline::{GeneratedText, TokenBuffer};
+use crate::settings::{Kind, SettingsForm};
 
 const HEATMAP_TOKEN_WIDTH: usize = 40;
 /// Most model rows the strip under the header will show before it scrolls.
@@ -63,6 +64,8 @@ pub struct Dashboard<'a> {
     pub demo: bool,
     /// Real routing from the patched server, when available.
     pub experts: Option<&'a ExpertStats>,
+    /// The settings screen, drawn over the view while it is open.
+    pub settings: Option<&'a SettingsForm>,
 }
 
 pub struct Renderer {
@@ -105,6 +108,9 @@ impl Renderer {
                 area,
             );
             self.render_view(frame, area, d);
+            if let Some(form) = d.settings {
+                self.render_settings(frame, area, form);
+            }
             Ok(())
         });
     }
@@ -1465,6 +1471,7 @@ impl Renderer {
             ));
         }
         items.push(("t", format!("theme:{}", d.theme_name), false));
+        items.push(("s", "settings".into(), d.settings.is_some()));
         items.push(("r", "rescan".into(), false));
 
         let cost = |it: &[(&str, String, bool)]| -> usize {
@@ -1477,6 +1484,7 @@ impl Renderer {
                 match *k {
                     "t" => *l = "theme".into(),
                     "b" => *l = "bw".into(),
+                    "s" => *l = "set".into(),
                     "↹" => *l = format!("{}/{}", d.focus + 1, d.models.len()),
                     _ => {}
                 }
@@ -1516,6 +1524,96 @@ impl Renderer {
             Paragraph::new(Line::from(spans)).style(Style::default().bg(pal::c(pal::PANEL))),
             area,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings screen (s)
+// ---------------------------------------------------------------------------
+
+impl Renderer {
+    fn render_settings(&self, frame: &mut Frame, area: Rect, form: &SettingsForm) {
+        let width = area.width.saturating_sub(4).min(96);
+        let height = (form.fields.len() as u16 + 7).min(area.height.saturating_sub(2));
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, rect);
+        let block = panel(" settings ", pal::CYAN);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        let w = inner.width as usize;
+        let label_w = 20;
+        let dim = Style::default().fg(pal::c(pal::TEXT_DIM));
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, f) in form.fields.iter().enumerate() {
+            let sel = i == form.selected;
+            let fg = if sel { pal::CYAN } else { pal::TEXT };
+            let mut style = Style::default().fg(pal::c(fg));
+            if sel {
+                style = style.bg(pal::c(pal::TRACK)).add_modifier(Modifier::BOLD);
+            }
+            let value = match (&form.editing, f.kind) {
+                (Some(buf), _) if sel => format!("{buf}▏"),
+                (_, Kind::Choice(_)) => format!("‹ {} ›", f.value),
+                _ => f.value.clone(),
+            };
+            let mut tags = String::new();
+            if f.edited() {
+                tags.push_str(" *");
+            }
+            if f.next_launch {
+                tags.push_str(" (next launch)");
+            }
+            let room = w.saturating_sub(label_w + 3 + tags.chars().count());
+            let mut spans = vec![
+                Span::styled(if sel { " ▸ " } else { "   " }, style),
+                Span::styled(format!("{:<label_w$}", f.label), style),
+                Span::styled(truncate(&value, room), style),
+                Span::styled(tags, Style::default().fg(pal::c(pal::AMBER))),
+            ];
+            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            if sel {
+                spans.push(Span::styled(" ".repeat(w.saturating_sub(used)), style));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::raw(""));
+        let help = &form.fields[form.selected].help;
+        lines.push(match &form.error {
+            Some(e) => Line::styled(
+                truncate(&format!(" {e}"), w),
+                Style::default().fg(pal::c(pal::MAGENTA)),
+            ),
+            None => Line::styled(truncate(&format!(" {help}"), w), dim),
+        });
+        lines.push(Line::raw(""));
+        let keys: &[(&str, &str)] = if form.editing.is_some() {
+            &[("enter", "done"), ("esc", "cancel")]
+        } else {
+            &[
+                ("↑↓", "select"),
+                ("←→/enter", "change"),
+                ("d", "default"),
+                ("a", "apply now"),
+                ("w", "save as default"),
+                ("esc", "close"),
+            ]
+        };
+        let mut spans = Vec::new();
+        for (k, label) in keys {
+            spans.push(Span::styled(
+                format!(" {k}"),
+                Style::default().fg(pal::c(pal::TEXT)).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!(" {label} "), dim));
+        }
+        lines.push(Line::from(fit_spans(&spans, w)));
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 

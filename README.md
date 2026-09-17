@@ -142,8 +142,11 @@ console, pass `--color truecolor` if colours look flat.
 - [ ] Model paths with spaces (e.g. under `C:\Users\Jane Doe\models`). The
       command line is split on whitespace, so the path and the GGUF details
       are likely to be missing.
-- [ ] `--log-db llm.db` writes rows; `--log-db` with a path in a missing
-      folder fails with a readable error.
+- [ ] With no flags, rows are written to `%LOCALAPPDATA%\llm-visuals\llm.db`;
+      `--log-db llm.db` writes there instead; a path that cannot be created
+      (e.g. on a missing drive) fails with a readable error.
+- [ ] `s`, change a value, `w`: `%APPDATA%\llm-visuals\settings.json` is
+      written and the value is used at the next launch.
 - [ ] `--model <hf-id>` starts the Python bridge.
 - [ ] Resizing the window and very small window sizes.
 
@@ -283,6 +286,7 @@ watched and `--pid A,B` restricts it to named processes.
 | `1`–`9` | focus that model directly |
 | `t` | cycle theme: defrag, neon, fire, ocean, monochrome |
 | `r` | rescan for running servers |
+| `s` | settings screen: change launch options, apply them now or save them as the default |
 | `q` / `Esc` | quit |
 
 Layouts adapt: the model strip is the first thing shed on a short terminal,
@@ -364,14 +368,38 @@ servers cost nothing.
 --color auto|truecolor|256
 --theme defrag|neon|fire|ocean|monochrome
 --max-layers N, --max-heads N     caps for the attention view
---log-db FILE        append samples and finished requests to a SQLite file
+--log-db auto|off|FILE  SQLite log of samples and requests (default: auto)
 --log-every 1.0      seconds between --log-db sample rows
 --log-db-max-mb 1024 size cap for --log-db; oldest rows are dropped (0 = none)
 ```
 
 `llm-visuals --help` lists everything.
 
-With `--log-db`, three tables are written (timestamps are Unix seconds):
+### Settings screen and saved defaults
+
+Press `s` to change the theme, colour depth, poll interval, model limits,
+GPUs and logging while the dashboard runs. `a` applies the values to this
+session; `w` also saves them as the launch default, in
+`~/.config/llm-visuals/settings.json` (`%APPDATA%\llm-visuals` on Windows,
+`~/Library/Application Support/llm-visuals` on macOS). The file maps flag
+names to values, e.g. `{"theme": "neon", "poll-ms": "500"}`. Saved values are
+read as if typed before your own flags, so a flag on the command line still
+wins. Only values that differ from the built-in default are kept. The GPU
+selection takes effect at the next launch; everything else applies at once.
+If the file holds a bad value, the dashboard starts without it and says why
+in the status line.
+
+### SQLite log
+
+Logging is on by default. `--log-db auto` writes to
+`~/.local/share/llm-visuals/llm.db` (`%LOCALAPPDATA%\llm-visuals` on
+Windows, `~/Library/Application Support/llm-visuals` on macOS); pass a path
+to use another file, or `--log-db off` to turn it off. `--demo` does not log
+unless given an explicit path, so synthetic numbers stay out of the real
+history. If the default location cannot be opened, the dashboard keeps
+running without logging; an explicit path that fails is an error.
+
+Three tables are written (timestamps are Unix seconds):
 `model_samples` (decode/prefill tok/s, context fill, session totals per model),
 `gpu_samples` (utilisation, VRAM, power, temperature per card) and `requests`
 (one row per finished request: tokens, TTFT, duration, average rates). The file
@@ -380,7 +408,7 @@ uses WAL, so it can be queried while the dashboard runs. Once the data passes
 SQLite reuses the freed pages, so the file stops growing at about that size.
 
 ```sh
-sqlite3 llm.db "SELECT model, AVG(avg_decode_tps) FROM requests GROUP BY model"
+sqlite3 ~/.local/share/llm-visuals/llm.db "SELECT model, AVG(avg_decode_tps) FROM requests GROUP BY model"
 ```
 
 ---
@@ -475,6 +503,8 @@ src/
 ├── model_detect.rs  finds the servers, parses their command lines
 ├── gguf.rs          GGUF header reader, layer → GPU mapping
 ├── demo.rs          synthetic servers for --demo
+├── settings.rs      settings screen, saved defaults, per-user paths
+├── dblog.rs         SQLite log (--log-db)
 ├── colors.rs        palette, gradients, truecolor/256 gating
 └── llm/             optional HF transformers attention bridge
 patches/             llama.cpp patch for GET /experts

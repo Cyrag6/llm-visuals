@@ -177,7 +177,11 @@ pub fn parse_experts(body: &str) -> Option<ExpertStats> {
                     rows.iter()
                         .map(|r| {
                             r.as_array()
-                                .map(|ids| ids.iter().map(|e| e.as_i64().unwrap_or(-1) as i32).collect())
+                                .map(|ids| {
+                                    ids.iter()
+                                        .map(|e| e.as_i64().unwrap_or(-1) as i32)
+                                        .collect()
+                                })
                                 .unwrap_or_default()
                         })
                         .collect()
@@ -215,16 +219,27 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
     let (slot, n_slots, busy) = if let Some(arr) = v.as_array() {
         let busy = arr
             .iter()
-            .filter(|s| s.get("is_processing").and_then(|x| x.as_bool()).unwrap_or(false))
+            .filter(|s| {
+                s.get("is_processing")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false)
+            })
             .count();
         // Prefer the busy slot so multi-slot servers show the live request.
         let pick = arr
             .iter()
-            .find(|s| s.get("is_processing").and_then(|x| x.as_bool()).unwrap_or(false))
+            .find(|s| {
+                s.get("is_processing")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false)
+            })
             .or_else(|| arr.first())?;
         (pick, arr.len(), busy)
     } else {
-        let busy = v.get("is_processing").and_then(|x| x.as_bool()).unwrap_or(false);
+        let busy = v
+            .get("is_processing")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         (&v, 1, usize::from(busy))
     };
     let u = |k: &str| slot.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;

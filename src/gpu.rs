@@ -115,7 +115,12 @@ impl GpuMonitor {
             // ("Failed to initialize NVML: Driver/library version mismatch", ...).
             let msg = [output.stderr.as_slice(), output.stdout.as_slice()]
                 .iter()
-                .flat_map(|b| String::from_utf8_lossy(b).lines().map(str::to_string).collect::<Vec<_>>())
+                .flat_map(|b| {
+                    String::from_utf8_lossy(b)
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or_else(|| format!("nvidia-smi exited with {}", output.status));
             return Err(msg);

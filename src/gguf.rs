@@ -17,6 +17,32 @@ pub struct GgufInfo {
     pub n_embd: usize,
     /// llama.cpp `nextn_predict_layers` (MTP draft depth). 0 if not MTP.
     pub n_mtp: usize,
+    /// Hashed n-gram memory (llama.cpp "PLE / engrams"), if the model has one.
+    pub engram: Option<Engram>,
+}
+
+/// An engram module: a conditional-memory table indexed by hashing the last
+/// `ngram_size` tokens, read once per token and added to the residual stream
+/// at `layers`. llama.cpp stores it under the `<arch>.ple.*` keys and the
+/// `per_layer_token_embd` tensor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Engram {
+    /// Transformer layers the memory is injected into.
+    pub layers: Vec<usize>,
+    /// Tokens hashed together for one lookup (3 = trigrams).
+    pub ngram_size: usize,
+    /// Hash heads per n-gram order; total heads = (ngram_size - 1) * this.
+    pub heads_per_ngram: usize,
+    /// Rows in the table: the sum of every head's vocabulary.
+    pub n_slots: u64,
+    /// Width of one row (`embedding_length_per_layer_input`).
+    pub dim: usize,
+}
+
+impl Engram {
+    pub fn n_heads(&self) -> usize {
+        self.ngram_size.saturating_sub(1) * self.heads_per_ngram
+    }
 }
 
 impl GgufInfo {
@@ -68,6 +94,20 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
     let ctx_train = kv_usize(&map, &format!("{prefix}context_length")).unwrap_or(0);
     let n_embd = kv_usize(&map, &format!("{prefix}embedding_length")).unwrap_or(0);
     let n_mtp = kv_usize(&map, &format!("{prefix}nextn_predict_layers")).unwrap_or(0);
+    let engram = kv_usize(&map, &format!("{prefix}ple.ngram_size"))
+        .filter(|&n| n > 0)
+        .map(|ngram_size| Engram {
+            layers: kv_arr(&map, &format!("{prefix}ple.layers"))
+                .into_iter()
+                .map(|v| v as usize)
+                .collect(),
+            ngram_size,
+            heads_per_ngram: kv_usize(&map, &format!("{prefix}ple.heads_per_ngram")).unwrap_or(0),
+            n_slots: kv_arr(&map, &format!("{prefix}ple.head_vocab_sizes"))
+                .iter()
+                .sum(),
+            dim: kv_usize(&map, &format!("{prefix}embedding_length_per_layer_input")).unwrap_or(0),
+        });
     let name = kv_str(&map, "general.name")
         .or_else(|| kv_str(&map, "general.basename"))
         .unwrap_or_else(|| {
@@ -87,6 +127,7 @@ pub fn read_info(path: &Path) -> Result<GgufInfo, String> {
         ctx_train,
         n_embd,
         n_mtp,
+        engram,
     })
 }
 
@@ -101,6 +142,8 @@ pub struct TensorSummary {
     pub expert_bytes: u64,
     /// `token_embd`: a row lookup, not a matmul, so it is not streamed per token.
     pub embd_bytes: u64,
+    /// `per_layer_token_embd`: the engram table, also a row lookup per token.
+    pub engram_bytes: u64,
     /// Bytes per transformer block (`blk.N.*`), indexed by N.
     pub block_bytes: Vec<u64>,
     pub n_tensors: usize,
@@ -111,7 +154,11 @@ impl TensorSummary {
     /// speculative decoder): everything except the embedding lookup, with the
     /// expert tensors scaled by the routed fraction.
     pub fn active_bytes_per_token(&self, n_experts: usize, n_experts_used: usize) -> u64 {
-        let dense = self.total_bytes.saturating_sub(self.expert_bytes).saturating_sub(self.embd_bytes);
+        let dense = self
+            .total_bytes
+            .saturating_sub(self.expert_bytes)
+            .saturating_sub(self.embd_bytes)
+            .saturating_sub(self.engram_bytes);
         let experts = if n_experts > 0 && n_experts_used > 0 && n_experts_used < n_experts {
             (self.expert_bytes as f64 * n_experts_used as f64 / n_experts as f64) as u64
         } else {
@@ -121,9 +168,69 @@ impl TensorSummary {
     }
 }
 
+/// Sibling shards of a split GGUF (`name-00001-of-00003.gguf`), the given
+/// file first. A file without the split suffix is its own single shard.
+pub fn split_shards(path: &Path) -> Vec<std::path::PathBuf> {
+    let Some(stem) = path.file_name().and_then(|n| n.to_str()) else {
+        return vec![path.to_path_buf()];
+    };
+    // "<base>-<n>-of-<total>.gguf"
+    let parse = || -> Option<(String, usize, usize, usize)> {
+        let base = stem.strip_suffix(".gguf")?;
+        let (head, total) = base.rsplit_once("-of-")?;
+        let (name, n) = head.rsplit_once('-')?;
+        let width = n.len();
+        Some((
+            name.to_string(),
+            n.parse().ok()?,
+            total.parse().ok()?,
+            width,
+        ))
+    };
+    let Some((name, n, total, width)) = parse() else {
+        return vec![path.to_path_buf()];
+    };
+    if total == 0 || total > 256 || n == 0 || n > total {
+        return vec![path.to_path_buf()];
+    }
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let mut out = vec![path.to_path_buf()];
+    for i in 1..=total {
+        if i == n {
+            continue;
+        }
+        let p = dir.join(format!("{name}-{i:0width$}-of-{total:0width$}.gguf"));
+        if p.exists() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Tensor byte layout of a model. A split GGUF is summed over every shard
+/// found next to `path`; the first shard usually holds only the header.
+pub fn read_tensor_summary(path: &Path) -> Result<TensorSummary, String> {
+    let mut out = TensorSummary::default();
+    for shard in split_shards(path) {
+        let t = read_tensor_summary_one(&shard)?;
+        out.total_bytes += t.total_bytes;
+        out.expert_bytes += t.expert_bytes;
+        out.embd_bytes += t.embd_bytes;
+        out.engram_bytes += t.engram_bytes;
+        out.n_tensors += t.n_tensors;
+        if out.block_bytes.len() < t.block_bytes.len() {
+            out.block_bytes.resize(t.block_bytes.len(), 0);
+        }
+        for (i, b) in t.block_bytes.iter().enumerate() {
+            out.block_bytes[i] += b;
+        }
+    }
+    Ok(out)
+}
+
 /// Walk the whole header (including tokenizer arrays) to reach the tensor
 /// info table. Takes ~100 ms on a 25 GB file; call it once per detection.
-pub fn read_tensor_summary(path: &Path) -> Result<TensorSummary, String> {
+fn read_tensor_summary_one(path: &Path) -> Result<TensorSummary, String> {
     let file_len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     let mut f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut magic = [0u8; 4];
@@ -183,6 +290,9 @@ pub fn read_tensor_summary(path: &Path) -> Result<TensorSummary, String> {
         if name.starts_with("token_embd") {
             out.embd_bytes += size;
         }
+        if name.starts_with("per_layer_token_embd") {
+            out.engram_bytes += size;
+        }
         if let Some(rest) = name.strip_prefix("blk.") {
             if let Some(n) = rest.split('.').next().and_then(|n| n.parse::<usize>().ok()) {
                 if n < 4096 {
@@ -205,23 +315,39 @@ enum Val {
     #[allow(dead_code)]
     B(bool),
     S(String),
+    /// Short numeric array (long ones, e.g. tokenizer tables, are skipped).
+    Arr(Vec<u64>),
     Other,
 }
 
 fn kv_str(map: &[(String, Val)], key: &str) -> Option<String> {
-    map.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-        Val::S(s) => Some(s.clone()),
-        _ => None,
-    })
+    map.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Val::S(s) => Some(s.clone()),
+            _ => None,
+        })
 }
 
 fn kv_usize(map: &[(String, Val)], key: &str) -> Option<usize> {
-    map.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-        Val::U(n) => Some(*n as usize),
-        Val::I(n) if *n >= 0 => Some(*n as usize),
-        Val::F(n) if *n >= 0.0 => Some(*n as usize),
-        _ => None,
-    })
+    map.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Val::U(n) => Some(*n as usize),
+            Val::I(n) if *n >= 0 => Some(*n as usize),
+            Val::F(n) if *n >= 0.0 => Some(*n as usize),
+            _ => None,
+        })
+}
+
+fn kv_arr(map: &[(String, Val)], key: &str) -> Vec<u64> {
+    map.iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Val::Arr(a) => Some(a.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn read_u32(f: &mut File) -> Result<u32, String> {
@@ -266,10 +392,7 @@ fn read_value(f: &mut File, ty: u32) -> Result<Val, String> {
         }
         7 => Ok(Val::B(read_exact_n::<1>(f)?[0] != 0)),
         8 => Ok(Val::S(read_string(f)?)),
-        9 => {
-            skip_array(f)?;
-            Ok(Val::Other)
-        }
+        9 => read_array(f),
         10 => Ok(Val::U(read_u64(f)?)),
         11 => {
             let b = read_exact_n::<8>(f)?;
@@ -289,13 +412,23 @@ fn read_exact_n<const N: usize>(f: &mut File) -> Result<[u8; N], String> {
     Ok(b)
 }
 
-fn skip_array(f: &mut File) -> Result<(), String> {
+/// Keep small integer arrays (layer lists, table sizes); skip everything else.
+fn read_array(f: &mut File) -> Result<Val, String> {
     let at = read_u32(f)?;
     let n = read_u64(f)?;
+    let keep = n <= 256 && matches!(at, 0..=5 | 10 | 11);
+    let mut out = Vec::with_capacity(if keep { n as usize } else { 0 });
     for _ in 0..n {
-        let _ = read_value(f, at)?;
+        let v = read_value(f, at)?;
+        if keep {
+            match v {
+                Val::U(u) => out.push(u),
+                Val::I(i) => out.push(i.max(0) as u64),
+                _ => {}
+            }
+        }
     }
-    Ok(())
+    Ok(if keep { Val::Arr(out) } else { Val::Other })
 }
 
 /// Which GPU a layer lives on given llama.cpp `--tensor-split` percentages.
@@ -345,19 +478,43 @@ mod tests {
             return;
         }
         let info = read_info(path).expect("gguf header");
+        eprintln!("{info:?}");
         assert!(info.n_layers > 0);
         assert!(info.n_heads > 0);
         assert!(!info.architecture.is_empty());
         let t = read_tensor_summary(path).expect("tensor table");
-        let file_len = std::fs::metadata(path).unwrap().len();
+        eprintln!(
+            "{} shards, {} tensors, {:.1} GB, engram {:.1} GB",
+            split_shards(path).len(),
+            t.n_tensors,
+            t.total_bytes as f64 / 1e9,
+            t.engram_bytes as f64 / 1e9
+        );
+        let file_len: u64 = split_shards(path)
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
         // Every byte of the data section belongs to some tensor.
         assert!(t.total_bytes > file_len / 2 && t.total_bytes <= file_len);
         // block_count may or may not include the MTP/nextn blocks.
-        assert!(t.block_bytes.len() >= info.n_layers && t.block_bytes.len() <= info.n_layers + info.n_mtp + 1);
+        assert!(
+            t.block_bytes.len() >= info.n_layers
+                && t.block_bytes.len() <= info.n_layers + info.n_mtp + 1
+        );
         if info.is_moe() {
             assert!(t.expert_bytes > t.total_bytes / 2);
         }
         assert!(t.active_bytes_per_token(info.n_experts, info.n_experts_used) < t.total_bytes);
+    }
+
+    #[test]
+    fn split_shards_names_siblings() {
+        let one = split_shards(Path::new("/nope/model.gguf"));
+        assert_eq!(one.len(), 1);
+        // Missing siblings are skipped, the named shard is kept first.
+        let s = split_shards(Path::new("/nope/m-00002-of-00003.gguf"));
+        assert_eq!(s.len(), 1);
+        assert!(s[0].ends_with("m-00002-of-00003.gguf"));
     }
 
     #[test]
@@ -366,6 +523,7 @@ mod tests {
             total_bytes: 1000,
             expert_bytes: 800,
             embd_bytes: 50,
+            engram_bytes: 0,
             block_bytes: vec![],
             n_tensors: 3,
         };

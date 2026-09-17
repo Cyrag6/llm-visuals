@@ -43,7 +43,11 @@ impl HostMonitor {
     /// produced per PID: the system-wide fields (disk, memory, PCIe) are read
     /// once and shared, so watching six models costs no more `nvidia-smi`
     /// calls than watching one.
-    pub async fn run(self, tx: mpsc::Sender<Vec<(u32, HostSample)>>, mut pids_rx: watch::Receiver<Vec<u32>>) {
+    pub async fn run(
+        self,
+        tx: mpsc::Sender<Vec<(u32, HostSample)>>,
+        mut pids_rx: watch::Receiver<Vec<u32>>,
+    ) {
         let mut pcie_ok = true;
         let mut pcie_misses = 0u32;
         loop {
@@ -149,7 +153,9 @@ fn read_proc(pid: u32, s: &mut HostSample) {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
-        ProcessRefreshKind::nothing().with_memory().with_disk_usage(),
+        ProcessRefreshKind::nothing()
+            .with_memory()
+            .with_disk_usage(),
     );
     if let Some(p) = sys.process(pid) {
         // Windows counts every read the process made (files, pipes,
@@ -198,7 +204,9 @@ pub fn parse_dmon_pcie(txt: &str) -> Vec<(u32, f32, f32)> {
         if parts.len() <= col_rx.max(col_tx) {
             continue;
         }
-        let Ok(idx) = parts[0].parse::<u32>() else { continue };
+        let Ok(idx) = parts[0].parse::<u32>() else {
+            continue;
+        };
         let rx = parts[col_rx].parse::<f32>().unwrap_or(0.0);
         let tx = parts[col_tx].parse::<f32>().unwrap_or(0.0);
         rows.push((idx, rx, tx));
@@ -237,7 +245,9 @@ fn is_whole_disk(name: &str) -> bool {
     }
     if let Some(r) = name.strip_prefix("nvme") {
         // nvme0n1 yes, nvme0n1p1 no.
-        return r.contains('n') && !r.contains('p') && r.chars().all(|c| c.is_ascii_digit() || c == 'n');
+        return r.contains('n')
+            && !r.contains('p')
+            && r.chars().all(|c| c.is_ascii_digit() || c == 'n');
     }
     if let Some(r) = name.strip_prefix("mmcblk") {
         return r.chars().all(|c| c.is_ascii_digit());
@@ -303,7 +313,9 @@ mod tests {
     #[test]
     fn proc_counters() {
         assert_eq!(
-            parse_proc_io_read_bytes("rchar: 110351923\nwchar: 16874\nread_bytes: 4476928\nwrite_bytes: 0\n"),
+            parse_proc_io_read_bytes(
+                "rchar: 110351923\nwchar: 16874\nread_bytes: 4476928\nwrite_bytes: 0\n"
+            ),
             Some(4476928)
         );
         let stat = "288647 (llama-server) S 1 288647 288647 0 -1 4194560 5193983 0 10 0 12 3 0 0 20 0 111 0 1 2 3";

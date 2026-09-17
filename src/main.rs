@@ -2,19 +2,19 @@ mod bandwidth;
 mod colors;
 mod config;
 mod dblog;
-mod host;
 mod demo;
 mod fade;
 mod gguf;
 mod gpu;
+mod host;
 mod llm;
 mod model_detect;
 mod observe;
-mod vllm;
 mod perf;
 mod pipeline;
 mod render;
 mod settings;
+mod vllm;
 
 use config::{Args, ViewMode};
 use crossterm::{
@@ -349,7 +349,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
 
     if args.demo {
-        let n = if gpu_filter.is_empty() { 2 } else { gpu_filter.len().max(1) };
+        let n = if gpu_filter.is_empty() {
+            2
+        } else {
+            gpu_filter.len().max(1)
+        };
         let models: Vec<DetectedModel> = slots.iter().map(|s| s.model.clone()).collect();
         demo::spawn(
             live_tx.clone(),
@@ -373,7 +377,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         tokio::spawn(async move {
             // Two nvidia-smi calls per poll would be heavy; host counters at half rate is plenty.
-            HostMonitor::new(poll.max(Duration::from_millis(400))).run(host_tx, pids_rx).await;
+            HostMonitor::new(poll.max(Duration::from_millis(400)))
+                .run(host_tx, pids_rx)
+                .await;
         });
     }
 

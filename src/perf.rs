@@ -260,15 +260,21 @@ impl SpecStats {
         self.available = true;
         if let (Some(prev), Some(t0)) = (&self.last, self.last_time) {
             let d = |a: u64, b: u64| a.saturating_sub(b) as usize;
-            self.draft_win.push(t0, now, d(m.draft_tokens, prev.draft_tokens));
+            self.draft_win
+                .push(t0, now, d(m.draft_tokens, prev.draft_tokens));
             self.accept_win.push(t0, now, d(m.accepted, prev.accepted));
-            self.steps_win.push(t0, now, d(m.verify_steps, prev.verify_steps));
+            self.steps_win
+                .push(t0, now, d(m.verify_steps, prev.verify_steps));
             let drafts = self.draft_win.rate(now);
             let acc = self.accept_win.rate(now);
             let steps = self.steps_win.rate(now);
             self.drafts_per_sec = drafts;
             self.steps_per_sec = steps;
-            self.accept_rate = if drafts > 0.0 { (acc / drafts).clamp(0.0, 1.0) } else { 0.0 };
+            self.accept_rate = if drafts > 0.0 {
+                (acc / drafts).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             self.mean_accepted = if steps > 0.0 { acc / steps } else { 0.0 };
             // Record only while drafting so the sparkline is a real trace.
             if drafts > 0.0 {
@@ -335,7 +341,8 @@ impl Meter {
     }
 
     pub fn scale(&self) -> f32 {
-        self.full_scale.unwrap_or_else(|| self.max_seen.max(self.floor))
+        self.full_scale
+            .unwrap_or_else(|| self.max_seen.max(self.floor))
     }
 
     pub fn frac(&self) -> f32 {
@@ -456,9 +463,15 @@ impl BandwidthStats {
             };
             let disk = rate(s.disk_read_bytes, prev.disk_read_bytes).unwrap_or(0.0) / 1e6;
             self.disk.update(disk, now, dt);
-            self.proc_disk_mb_s = rate(s.proc_read_bytes, prev.proc_read_bytes).unwrap_or(0.0) / 1e6;
+            self.proc_disk_mb_s =
+                rate(s.proc_read_bytes, prev.proc_read_bytes).unwrap_or(0.0) / 1e6;
             self.majflt_per_s = rate(s.proc_majflt, prev.proc_majflt).unwrap_or(0.0);
-            let n = s.pcie_mb_s.iter().map(|(i, _, _)| *i as usize + 1).max().unwrap_or(0);
+            let n = s
+                .pcie_mb_s
+                .iter()
+                .map(|(i, _, _)| *i as usize + 1)
+                .max()
+                .unwrap_or(0);
             self.ensure_gpu(n, &[]);
             for (i, rx, tx) in &s.pcie_mb_s {
                 let i = *i as usize;
@@ -610,8 +623,7 @@ impl PerfTracker {
                     if done.prefill_tokens == 0 && done.decoded == 0 {
                         done.prompt_tokens = close.prompt;
                         done.cached_tokens = close.cached;
-                        done.prefill_tokens =
-                            close.prompt.saturating_sub(close.cached);
+                        done.prefill_tokens = close.prompt.saturating_sub(close.cached);
                         done.decoded = close.gen;
                         if close.ttft_secs > 0.0 {
                             done.ttft = Some(close.ttft_secs as f32);
@@ -687,17 +699,14 @@ impl PerfTracker {
         // interval. When a request closes in this window, use its
         // measured TTFT as the denominator instead (tokens / TTFT).
         if !s.processing && s.ttft_secs > 0.0 && d_pre > 0 {
-            self.prefill_tps =
-                self.prefill_tps.max(d_pre as f32 / s.ttft_secs as f32);
+            self.prefill_tps = self.prefill_tps.max(d_pre as f32 / s.ttft_secs as f32);
         }
         // Same for decode: vLLM's generation counter moves only on the
         // completion poll — which is exactly when the window above was
         // cleared — so use the measured ITL sum (one sample per decode
         // step, i.e. decoded - 1 of them).
         if !s.processing && s.itl_sum > 0.0 && d_dec > 1 {
-            self.decode_tps = self
-                .decode_tps
-                .max((d_dec - 1) as f32 / s.itl_sum as f32);
+            self.decode_tps = self.decode_tps.max((d_dec - 1) as f32 / s.itl_sum as f32);
         }
         let ema = |prev: f32, x: f32, up: f32, down: f32| -> f32 {
             let a = if x > prev { up } else { down };
@@ -754,8 +763,7 @@ impl PerfTracker {
                 // span (admission -> last token). llama.cpp rows have
                 // no histograms and keep the detection-based span.
                 if done.ttft.map_or(false, |t| t > 0.0) {
-                    let e2e = done.ttft.unwrap() as f64
-                        + done.itl_sum.unwrap_or(0.0) as f64;
+                    let e2e = done.ttft.unwrap() as f64 + done.itl_sum.unwrap_or(0.0) as f64;
                     if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                         done.started = st;
                     }
@@ -837,7 +845,13 @@ fn push(h: &mut VecDeque<f32>, v: f32) {
 mod tests {
     use super::*;
 
-    fn slot(id: i64, processing: bool, prompt: usize, processed: usize, decoded: usize) -> LiveStats {
+    fn slot(
+        id: i64,
+        processing: bool,
+        prompt: usize,
+        processed: usize,
+        decoded: usize,
+    ) -> LiveStats {
         LiveStats {
             ctx_max: 4096,
             prompt_tokens: prompt,
@@ -858,7 +872,11 @@ mod tests {
         p.observe(&slot(2, true, 1000, 200, 0), t0 + step);
         assert_eq!(p.phase, Phase::Prefill);
         p.observe(&slot(2, true, 1000, 600, 0), t0 + step * 2);
-        assert!((p.prefill_tps - 1500.0).abs() < 1.0, "prefill {}", p.prefill_tps);
+        assert!(
+            (p.prefill_tps - 1500.0).abs() < 1.0,
+            "prefill {}",
+            p.prefill_tps
+        );
         p.observe(&slot(2, true, 1000, 1000, 0), t0 + step * 3);
         p.observe(&slot(2, true, 1000, 1000, 10), t0 + step * 4);
         assert_eq!(p.phase, Phase::Decode);
@@ -927,17 +945,33 @@ mod tests {
         let r = p.history.back().expect("finished request");
         assert_eq!(r.prefill_tokens, 1000);
         // The user's formula: total prefill tokens / TTFT.
-        assert!((r.avg_prefill_tps() - 500.0).abs() < 1.0, "{}", r.avg_prefill_tps());
+        assert!(
+            (r.avg_prefill_tps() - 500.0).abs() < 1.0,
+            "{}",
+            r.avg_prefill_tps()
+        );
         assert!((r.ttft().map(|d| d.as_secs_f64()).unwrap() - 2.0).abs() < 1e-6);
         // Decode: 39 inter-token gaps over the server-measured
         // span (itl_sum = 0.05 s total).
-        assert!((r.avg_decode_tps() - 39.0 / 0.05).abs() < 1.0, "{}", r.avg_decode_tps());
+        assert!(
+            (r.avg_decode_tps() - 39.0 / 0.05).abs() < 1.0,
+            "{}",
+            r.avg_decode_tps()
+        );
         // The graph spike is bounded by the same measurement, not by
         // one poll interval (which would say 5000 tok/s here).
-        assert!((p.peak_prefill_tps - 500.0).abs() < 1.0, "{}", p.peak_prefill_tps);
+        assert!(
+            (p.peak_prefill_tps - 500.0).abs() < 1.0,
+            "{}",
+            p.peak_prefill_tps
+        );
         // Decode likewise: the completion poll is the only one where the
         // counter moves, so without the ITL clamp this would read 0.
-        assert!((p.peak_decode_tps - 39.0 / 0.05).abs() < 1.0, "{}", p.peak_decode_tps);
+        assert!(
+            (p.peak_decode_tps - 39.0 / 0.05).abs() < 1.0,
+            "{}",
+            p.peak_decode_tps
+        );
     }
 
     #[test]
@@ -952,13 +986,22 @@ mod tests {
         // the same poll. The baseline re-anchors onto B, so the closing
         // view is the only place A's counters survive.
         p.observe(
-            &vllm_slot(6, true, 0, 0, 0, 0.0, 0.0, Some(crate::observe::ClosingRequest {
-                prompt: 1000,
-                cached: 100,
-                gen: 40,
-                ttft_secs: 2.0,
-                itl_sum: 0.05,
-            })),
+            &vllm_slot(
+                6,
+                true,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                Some(crate::observe::ClosingRequest {
+                    prompt: 1000,
+                    cached: 100,
+                    gen: 40,
+                    ttft_secs: 2.0,
+                    itl_sum: 0.05,
+                }),
+            ),
             t0 + step + Duration::from_secs(17),
         );
         // A's row exists and is complete despite the re-anchor.
@@ -970,10 +1013,17 @@ mod tests {
             .expect("the finished request keeps a row");
         assert_eq!(a.prefill_tokens, 900, "prompt minus cache");
         assert_eq!(a.decoded, 40);
-        assert!((a.avg_prefill_tps() - 450.0).abs() < 1.0, "{}", a.avg_prefill_tps());
+        assert!(
+            (a.avg_prefill_tps() - 450.0).abs() < 1.0,
+            "{}",
+            a.avg_prefill_tps()
+        );
         assert!((a.avg_decode_tps() - 39.0 / 0.05).abs() < 1.0);
         // B is measured against the re-anchored baseline.
-        p.observe(&vllm_slot(6, false, 50, 50, 20, 0.5, 0.1, None), t0 + step * 2 + Duration::from_secs(17));
+        p.observe(
+            &vllm_slot(6, false, 50, 50, 20, 0.5, 0.1, None),
+            t0 + step * 2 + Duration::from_secs(17),
+        );
         let b = p
             .history
             .iter()
@@ -982,7 +1032,7 @@ mod tests {
             .expect("B's row");
         assert_eq!(b.prefill_tokens, 50);
         assert_eq!(b.decoded, 20);
-        assert!((b.avg_prefill_tps() - 100.0).abs() < 1.0, "50 / 0.5 s", );
+        assert!((b.avg_prefill_tps() - 100.0).abs() < 1.0, "50 / 0.5 s",);
         assert_eq!(p.session_prefilled, 950, "900 (A) + 50 (B)");
         assert_eq!(p.session_decoded, 60);
         assert_eq!(p.history.len(), 2);
@@ -999,13 +1049,22 @@ mod tests {
         p.observe(&slot(1, false, 0, 0, 0), t0);
         p.observe(&vllm_slot(5, true, 0, 0, 0, 0.0, 0.0, None), t0 + step);
         p.observe(
-            &vllm_slot(6, true, 0, 0, 0, 0.0, 0.0, Some(crate::observe::ClosingRequest {
-                prompt: 100,
-                cached: 0,
-                gen: 10,
-                ttft_secs: 0.0,
-                itl_sum: 0.0,
-            })),
+            &vllm_slot(
+                6,
+                true,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                Some(crate::observe::ClosingRequest {
+                    prompt: 100,
+                    cached: 0,
+                    gen: 10,
+                    ttft_secs: 0.0,
+                    itl_sum: 0.0,
+                }),
+            ),
             t0 + step * 2,
         );
         let a = p.history.iter().find(|r| r.id_task == 5).expect("row kept");
@@ -1022,7 +1081,11 @@ mod tests {
             w.push(ms(a), ms(a + 200), *n);
         }
         // 24 tokens over the full second, not 40 during the burst samples.
-        assert!((w.rate(ms(1000)) - 24.0).abs() < 0.1, "{}", w.rate(ms(1000)));
+        assert!(
+            (w.rate(ms(1000)) - 24.0).abs() < 0.1,
+            "{}",
+            w.rate(ms(1000))
+        );
         for i in 5..12u64 {
             w.push(ms(i * 200), ms(i * 200 + 200), 0);
         }
@@ -1045,7 +1108,11 @@ mod tests {
         p.observe_spec(&m(140, 85, 140), t0 + Duration::from_millis(400));
         assert!(p.spec.available);
         // 25 accepted of 40 drafted in the window.
-        assert!((p.spec.accept_rate - 0.625).abs() < 1e-3, "{}", p.spec.accept_rate);
+        assert!(
+            (p.spec.accept_rate - 0.625).abs() < 1e-3,
+            "{}",
+            p.spec.accept_rate
+        );
         assert!((p.spec.mean_accepted - 0.625).abs() < 1e-3);
         assert!((p.spec.session_accept_rate() - 85.0 / 140.0).abs() < 1e-4);
         assert_eq!(p.spec.accept_hist.len(), 2);
@@ -1082,21 +1149,37 @@ mod tests {
             ..Default::default()
         };
         p.observe_host(&s(1_000_000_000, 500_000_000, 100, 10.0), t0);
-        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 800.0), t0 + Duration::from_millis(200));
-        assert!((p.bw.disk.value - 1000.0).abs() < 1.0, "{}", p.bw.disk.value);
+        p.observe_host(
+            &s(1_200_000_000, 550_000_000, 150, 800.0),
+            t0 + Duration::from_millis(200),
+        );
+        assert!(
+            (p.bw.disk.value - 1000.0).abs() < 1.0,
+            "{}",
+            p.bw.disk.value
+        );
         assert!((p.bw.proc_disk_mb_s - 250.0).abs() < 1.0);
         assert!((p.bw.majflt_per_s - 250.0).abs() < 1.0);
         assert_eq!(p.bw.pcie_rx.len(), 2);
         assert_eq!(p.bw.pcie_rx[0].value, 800.0);
         assert_eq!(p.bw.pcie_rx[1].value, 400.0);
         // A garbage dmon sample is dropped: the meter keeps its last reading.
-        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 209_688.0), t0 + Duration::from_millis(400));
+        p.observe_host(
+            &s(1_200_000_000, 550_000_000, 150, 209_688.0),
+            t0 + Duration::from_millis(400),
+        );
         assert_eq!(p.bw.pcie_rx[0].value, 800.0);
         assert_eq!(p.bw.pcie_rx[0].hold, 800.0);
         p.bw.pcie_rx[0].full_scale = Some(7_880.0);
-        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 9_000.0), t0 + Duration::from_millis(600));
+        p.observe_host(
+            &s(1_200_000_000, 550_000_000, 150, 9_000.0),
+            t0 + Duration::from_millis(600),
+        );
         assert_eq!(p.bw.pcie_rx[0].value, 800.0, "above the link cap: dropped");
-        p.observe_host(&s(1_200_000_000, 550_000_000, 150, 7_000.0), t0 + Duration::from_millis(800));
+        p.observe_host(
+            &s(1_200_000_000, 550_000_000, 150, 7_000.0),
+            t0 + Duration::from_millis(800),
+        );
         assert_eq!(p.bw.pcie_rx[0].value, 7_000.0);
     }
 
@@ -1124,7 +1207,12 @@ mod tests {
         p.tick_bandwidth(&layout, t0 + step * 2, 0.2);
         let steps = p.bw.steps_per_s;
         assert!(steps > 0.0);
-        assert!((p.bw.ram.value - steps).abs() < 1e-3, "ram {} steps {}", p.bw.ram.value, steps);
+        assert!(
+            (p.bw.ram.value - steps).abs() < 1e-3,
+            "ram {} steps {}",
+            p.bw.ram.value,
+            steps
+        );
         assert!((p.bw.vram.value - 1.5 * steps).abs() < 1e-3);
     }
 

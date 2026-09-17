@@ -68,7 +68,8 @@ impl DbLog {
     /// inserts, so keeping this under the cap stops the file growing.
     fn used_bytes(&self) -> rusqlite::Result<u64> {
         let q = |p: &str| -> rusqlite::Result<i64> {
-            self.conn.query_row(&format!("PRAGMA {p}"), [], |r| r.get(0))
+            self.conn
+                .query_row(&format!("PRAGMA {p}"), [], |r| r.get(0))
         };
         Ok(((q("page_count")? - q("freelist_count")?) * q("page_size")?).max(0) as u64)
     }
@@ -209,7 +210,8 @@ mod tests {
         let gpus = [crate::gpu::DemoGpu::new(0).step(0.5)];
         let now = t0 + Duration::from_millis(700);
         for _ in 0..2 {
-            log.tick(std::iter::once((&model, &perf, 110, 8192)), &gpus, now).unwrap();
+            log.tick(std::iter::once((&model, &perf, 110, 8192)), &gpus, now)
+                .unwrap();
         }
         let count = |t: &str| -> i64 {
             log.conn
@@ -238,14 +240,17 @@ mod tests {
         let gpus = [crate::gpu::DemoGpu::new(0).step(0.5)];
         let now = Instant::now();
         for _ in 0..3000 {
-            log.tick(std::iter::once((&model, &perf, 0, 8192)), &gpus, now).unwrap();
+            log.tick(std::iter::once((&model, &perf, 0, 8192)), &gpus, now)
+                .unwrap();
         }
         assert!(log.used_bytes().unwrap() <= cap);
         let (min, max): (i64, i64) = log
             .conn
-            .query_row("SELECT MIN(rowid), MAX(rowid) FROM model_samples", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT MIN(rowid), MAX(rowid) FROM model_samples",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(max, 3000, "newest row kept");
         assert!(min > 1, "oldest rows dropped");

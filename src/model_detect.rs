@@ -61,7 +61,12 @@ impl DetectedModel {
         while parts.len() > 1 {
             let last = parts[parts.len() - 1].to_ascii_uppercase();
             let quantish = last.starts_with('Q') && last.chars().any(|c| c.is_ascii_digit());
-            if quantish || matches!(last.as_str(), "UD" | "GGUF" | "K" | "XL" | "M" | "S" | "L" | "0" | "1") {
+            if quantish
+                || matches!(
+                    last.as_str(),
+                    "UD" | "GGUF" | "K" | "XL" | "M" | "S" | "L" | "0" | "1"
+                )
+            {
                 parts.pop();
             } else {
                 break;
@@ -120,7 +125,9 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
         }
         let mp = unescape_mount(f[4]);
         if target.starts_with(&mp)
-            && best.as_ref().map_or(true, |(_, _, bmp)| mp.len() > bmp.len())
+            && best
+                .as_ref()
+                .map_or(true, |(_, _, bmp)| mp.len() > bmp.len())
         {
             best = Some((f[2].to_string(), unescape_mount(f[3]), mp));
         }
@@ -276,9 +283,7 @@ fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
         // all sharing the container IP); only the mapping whose container
         // side is the server's own port is ours.
         if let (Some(ip), Some(port)) = (&container_ip, host_port) {
-            if ips.iter().any(|x| x == ip)
-                && container_port == Some(cmdline_port.unwrap_or(8000))
-            {
+            if ips.iter().any(|x| x == ip) && container_port == Some(cmdline_port.unwrap_or(8000)) {
                 return Some(port);
             }
         }
@@ -327,7 +332,10 @@ fn fib_local_ips(text: &str) -> Vec<String> {
 
 fn is_ipv4(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Scan GPU compute apps + process cmdlines for inference servers.
@@ -335,7 +343,8 @@ fn is_ipv4(s: &str) -> bool {
 /// to monitor.
 pub fn detect_models() -> Vec<DetectedModel> {
     let gpu_procs = nvidia_compute_apps();
-    let mut by_pid: std::collections::HashMap<u32, DetectedModel> = std::collections::HashMap::new();
+    let mut by_pid: std::collections::HashMap<u32, DetectedModel> =
+        std::collections::HashMap::new();
 
     for app in gpu_procs {
         let cmdline = read_cmdline(app.pid).unwrap_or_else(|| app.process_name.clone());
@@ -408,7 +417,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
                 tensor_split: parsed.tensor_split,
                 cmdline,
                 gguf: None,
-            tensors: None,
+                tensors: None,
             },
         );
     }
@@ -525,7 +534,18 @@ fn is_interpreter(argv0: &str) -> bool {
     }
     matches!(
         base.as_str(),
-        "gjs" | "node" | "nodejs" | "ruby" | "perl" | "bash" | "sh" | "zsh" | "java" | "dotnet" | "uv" | "uvx"
+        "gjs"
+            | "node"
+            | "nodejs"
+            | "ruby"
+            | "perl"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "java"
+            | "dotnet"
+            | "uv"
+            | "uvx"
     )
 }
 
@@ -607,9 +627,11 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
         } else {
             (t, None)
         };
-        let next = || inline.map(|s| s.to_string()).or_else(|| {
-            tokens.get(i + 1).map(|s| s.to_string())
-        });
+        let next = || {
+            inline
+                .map(|s| s.to_string())
+                .or_else(|| tokens.get(i + 1).map(|s| s.to_string()))
+        };
 
         match key {
             "--model" | "-m" | "--model-path" => {
@@ -708,10 +730,8 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
             }
             "--tensor-split" | "--tensor_split" => {
                 if let Some(v) = next() {
-                    parsed.tensor_split = v
-                        .split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
+                    parsed.tensor_split =
+                        v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
                     if inline.is_none() {
                         i += 1;
                     }
@@ -730,16 +750,14 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
                     || key.ends_with(".gguf")
                     || key.ends_with(".safetensors")) =>
             {
-                {
-                    let p = PathBuf::from(&key);
-                    if parsed.name.is_empty() {
-                        parsed.name = p
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| key.to_string());
-                    }
-                    parsed.path = Some(p);
+                let p = PathBuf::from(&key);
+                if parsed.name.is_empty() {
+                    parsed.name = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| key.to_string());
                 }
+                parsed.path = Some(p);
             }
             _ => {}
         }
@@ -820,7 +838,8 @@ fn walk_proc_llms() -> Vec<(u32, String, String)> {
             // Another user's or an elevated process hides its argv; its name
             // still identifies the engine and the default port.
             let cmdline = cmdline_of(p).unwrap_or_else(|| name.clone());
-            (looks_like_llm(&name, &cmdline) && !is_self(pid, &cmdline)).then_some((pid, name, cmdline))
+            (looks_like_llm(&name, &cmdline) && !is_self(pid, &cmdline))
+                .then_some((pid, name, cmdline))
         })
         .collect()
 }
@@ -840,7 +859,11 @@ fn read_cmdline(pid: u32) -> Option<String> {
 
 #[cfg(not(target_os = "linux"))]
 fn cmdline_of(p: &sysinfo::Process) -> Option<String> {
-    let args: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    let args: Vec<String> = p
+        .cmd()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     (!args.is_empty()).then(|| args.join(" "))
 }
 
@@ -928,13 +951,19 @@ mod tests {
         assert_eq!(p.spec_type.as_deref(), Some("draft-mtp"));
         assert_eq!(p.tensor_split, vec![63.0, 37.0]);
         assert_eq!(p.engine, "llama.cpp");
-        assert!(p.path.unwrap().ends_with("Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf"));
+        assert!(p
+            .path
+            .unwrap()
+            .ends_with("Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf"));
     }
 
     #[test]
     fn module_flags_are_not_models() {
         // `-m` after an interpreter runs a module; these are not LLM servers.
-        assert!(!looks_like_llm("python3", "/usr/bin/python3 -m http.server 8470"));
+        assert!(!looks_like_llm(
+            "python3",
+            "/usr/bin/python3 -m http.server 8470"
+        ));
         assert!(!looks_like_llm(
             "gjs",
             "/usr/bin/gjs -m /usr/share/gnome-shell/org.gnome.Shell.Notifications"
@@ -948,7 +977,10 @@ mod tests {
             "llama-server",
             "/opt/bin/llama-server -m /models/Qwen3-4B-Q6_K.gguf -c 8192"
         ));
-        assert!(looks_like_llm("serve", "./serve --model-path mistralai/Mistral-7B"));
+        assert!(looks_like_llm(
+            "serve",
+            "./serve --model-path mistralai/Mistral-7B"
+        ));
     }
 
     #[test]
@@ -961,7 +993,10 @@ mod tests {
     fn vllm_phantoms_are_filtered() {
         // The real server: the bare `vllm` main process, with or without
         // an explicit --port (8000 is vLLM's default).
-        assert!(!is_vllm_phantom("vllm", "/opt/venv/bin/vllm serve /model --port 8000"));
+        assert!(!is_vllm_phantom(
+            "vllm",
+            "/opt/venv/bin/vllm serve /model --port 8000"
+        ));
         assert!(!is_vllm_phantom("vllm", "/opt/venv/bin/vllm serve /model"));
         // Named helpers inherit the parent command line -- including
         // --port -- so the process name, not the arguments, decides.
@@ -979,16 +1014,25 @@ mod tests {
             "docker",
             "docker run --rm --name steve image vllm serve /model --port 8000"
         ));
-        assert!(is_vllm_phantom("bash", "bash /home/seth/epyc/vllm-b70/run_vllm.sh"));
+        assert!(is_vllm_phantom(
+            "bash",
+            "bash /home/seth/epyc/vllm-b70/run_vllm.sh"
+        ));
         // The comm is rarely the literal "vllm": python entrypoints and
         // renamed mains are still the real server.
         assert!(!is_vllm_phantom(
             "python3",
             "/usr/bin/python3 -m vllm.entrypoints.openai.api_server --model /m"
         ));
-        assert!(!is_vllm_phantom("pt_main_thread", "/opt/venv/bin/vllm serve /model"));
+        assert!(!is_vllm_phantom(
+            "pt_main_thread",
+            "/opt/venv/bin/vllm serve /model"
+        ));
         // nvidia-smi reports the executable path, not the comm.
-        assert!(!is_vllm_phantom("/opt/venv/bin/vllm", "/opt/venv/bin/vllm serve /model"));
+        assert!(!is_vllm_phantom(
+            "/opt/venv/bin/vllm",
+            "/opt/venv/bin/vllm serve /model"
+        ));
     }
 
     #[test]
@@ -1006,7 +1050,10 @@ mod tests {
 
         // Positional after unhandled flags: the flag's bare value must not
         // be taken for the weights either.
-        let p = parse_cmdline("vllm", "/opt/venv/bin/vllm serve --dtype float16 /models/qwen");
+        let p = parse_cmdline(
+            "vllm",
+            "/opt/venv/bin/vllm serve --dtype float16 /models/qwen",
+        );
         assert_eq!(p.path.as_deref(), Some(Path::new("/models/qwen")));
         assert_eq!(p.name, "qwen");
 

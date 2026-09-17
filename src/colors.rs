@@ -35,8 +35,17 @@ fn detect_truecolor() -> bool {
     let term = env("TERM");
     let prog = env("TERM_PROGRAM");
     let hints = [
-        "kitty", "alacritty", "wezterm", "foot", "ghostty", "direct", "iterm", "vscode", "konsole",
-        "contour", "rio",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "foot",
+        "ghostty",
+        "direct",
+        "iterm",
+        "vscode",
+        "konsole",
+        "contour",
+        "rio",
     ];
     if hints.iter().any(|h| term.contains(h) || prog.contains(h)) {
         return true;

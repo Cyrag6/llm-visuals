@@ -201,6 +201,13 @@ the mean number of distinct experts each layer touched over its last 256
 tokens). Without the patch the title reads `simulated`: the timing is real
 (each new token re-routes every layer) but the identities are a stand-in.
 
+If the model carries an **engram** module (a hashed n-gram memory; llama.cpp's
+`<arch>.ple.*` keys, as in Qwen3.8-Flash-Next), the bottom row of the expert
+panel describes it: n-gram order, the layer it feeds, hash heads, table rows ×
+width, and the table's size on disk. It is one row lookup per token rather
+than a routed matmul, so it is not drawn as a grid and its bytes are left out
+of the per-token bandwidth estimate. The model strip shows `engram N-gram`.
+
 ### Memory pipeline
 
 Press `b` for the bandwidth view: six VU-style channel strips, one per hop
@@ -309,7 +316,7 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | request log | one record per `id_task`; averages from accumulated deltas |
 | util, VRAM, power, °C, clocks, fan, PCIe | `nvidia-smi --query-gpu=…` every poll |
 | VRAM weights vs KV | **estimate**: GGUF file size × `--tensor-split` share; the rest of used VRAM is shown as KV, because the driver cannot see inside the process |
-| layers, heads, experts, MTP depth, quant | GGUF header of the model on the server's command line |
+| layers, heads, experts, MTP depth, engram, quant | GGUF header of the model on the server's command line |
 | layer → GPU | `--tensor-split` proportions |
 | layer activity | utilisation of the GPU the layer lives on, smoothed |
 | expert blocks | real top-k routing from `GET /experts` (patched server), else a deterministic stand-in keyed by layer and token step |
@@ -318,7 +325,7 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | resident weights | `RssFile` in `/proc/<pid>/status` |
 | PCIe MB/s | `nvidia-smi dmon -s t -c 1` rx/tx per GPU; samples above the link cap are dropped (dmon emits the odd garbage row) |
 | VRAM busy % | `utilization.memory` from `nvidia-smi` (memory-controller busy time) |
-| bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps), expert tensors × used/total, split CPU vs GPU by what the cards hold, × steps/s |
+| bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps, summed over every shard of a split file), expert tensors × used/total, embedding and engram tables excluded, split CPU vs GPU by what the cards hold, × steps/s |
 
 Per-request `timings` only appear inside completion responses, which the
 dashboard never sees, so everything is reconstructed from polled counters.

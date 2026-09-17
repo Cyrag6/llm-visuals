@@ -128,9 +128,7 @@ const PROFILES: &[DemoProfile] = &[
 /// The synthetic servers for `--demo-models n`, cycling the profiles if asked
 /// for more than there are.
 pub fn demo_models(ctx_max: usize, n: usize) -> Vec<DetectedModel> {
-    (0..n.max(1))
-        .map(|i| demo_model_n(ctx_max, i))
-        .collect()
+    (0..n.max(1)).map(|i| demo_model_n(ctx_max, i)).collect()
 }
 
 fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
@@ -152,7 +150,11 @@ fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
         mem_used_mb: p.mem_used_mb,
         port: Some(8080 + idx as u16),
         ctx_max: Some(ctx),
-        spec_type: if p.n_mtp > 0 { Some("draft-mtp".into()) } else { None },
+        spec_type: if p.n_mtp > 0 {
+            Some("draft-mtp".into())
+        } else {
+            None
+        },
         n_gpu_layers: Some(99),
         tensor_split: p.tensor_split.to_vec(),
         cmdline: format!("llama-server --demo --port {}", 8080 + idx),
@@ -167,12 +169,14 @@ fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
             ctx_train: ctx,
             n_embd: p.n_embd,
             n_mtp: p.n_mtp,
+            engram: None,
         }),
         // Shaped like a real file of that class: for an MoE most bytes are experts.
         tensors: Some(crate::gguf::TensorSummary {
             total_bytes: p.file_bytes,
             expert_bytes: p.expert_bytes,
             embd_bytes: p.embd_bytes,
+            engram_bytes: 0,
             block_bytes: vec![p.file_bytes / p.n_layers as u64; p.n_layers],
             n_tensors: 753,
         }),
@@ -238,7 +242,8 @@ fn spawn_server(
         let gg = model.gguf.as_ref().unwrap();
         let moe = gg.n_experts > 0;
         // Each server gets its own seed so they do not move in lockstep.
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_add((idx as u64 + 1).wrapping_mul(0x9E37_79B9));
+        let mut seed =
+            0x9E37_79B9_7F4A_7C15u64.wrapping_add((idx as u64 + 1).wrapping_mul(0x9E37_79B9));
         let tick = Duration::from_millis(200);
         let mut id_task: i64 = 1000 + idx as i64 * 100;
         let mut cache_tokens: usize = 0;
@@ -246,7 +251,11 @@ fn spawn_server(
         let mut experts = DemoExperts::new(gg.n_layers, gg.n_experts, gg.n_experts_used);
         let mut stats = LiveStats {
             ctx_max,
-            spec_types: if gg.n_mtp > 0 { "none,draft-mtp".into() } else { "none".into() },
+            spec_types: if gg.n_mtp > 0 {
+                "none,draft-mtp".into()
+            } else {
+                "none".into()
+            },
             n_slots: 1,
             ..Default::default()
         };
@@ -341,7 +350,8 @@ fn spawn_server(
                 // MTP depth 1: every verification step drafts one token; the
                 // acceptance rate drifts so the panel has something to show.
                 if gg.n_mtp > 0 {
-                    let acc_rate = (0.62 + 0.25 * (t * 0.9).sin() + 0.08 * (t * 3.1).cos()).clamp(0.15, 0.95);
+                    let acc_rate =
+                        (0.62 + 0.25 * (t * 0.9).sin() + 0.08 * (t * 3.1).cos()).clamp(0.15, 0.95);
                     let accepted = (step as f32 * acc_rate / (1.0 + acc_rate)).round() as u64;
                     let steps = step as u64 - accepted;
                     spec.verify_steps += steps;

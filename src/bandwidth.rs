@@ -78,7 +78,10 @@ fn ubatch_from(cmdline: &str) -> usize {
                 return v;
             }
         }
-        if let Some(v) = t.strip_prefix("--ubatch-size=").and_then(|v| v.parse().ok()) {
+        if let Some(v) = t
+            .strip_prefix("--ubatch-size=")
+            .and_then(|v| v.parse().ok())
+        {
             return v;
         }
     }
@@ -95,16 +98,27 @@ pub fn assess(p: &PerfTracker, gpus: &[GpuStats]) -> Verdict {
         .vram_busy
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.value.partial_cmp(&b.1.value).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1.value
+                .partial_cmp(&b.1.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(i, _)| i)
         .unwrap_or(0);
-    let max_gpu_util = gpus.iter().map(|g| g.utilization_gpu).fold(0.0f32, f32::max);
+    let max_gpu_util = gpus
+        .iter()
+        .map(|g| g.utilization_gpu)
+        .fold(0.0f32, f32::max);
     let pcie_frac = bw.pcie_rx.iter().map(|m| m.frac()).fold(0.0f32, f32::max);
     let pcie_busiest = bw
         .pcie_rx
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.frac().partial_cmp(&b.1.frac()).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1.frac()
+                .partial_cmp(&b.1.frac())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(i, _)| i)
         .unwrap_or(0);
     let disk_busy = bw.disk.value > 50.0 || bw.proc_disk_mb_s > 20.0 || bw.majflt_per_s > 50.0;
@@ -140,14 +154,20 @@ pub fn assess(p: &PerfTracker, gpus: &[GpuStats]) -> Verdict {
                 return Verdict {
                     stage: Some(StageId::Pcie),
                     headline: format!("PCIe link to GPU {pcie_busiest} is the bound"),
-                    detail: format!("{:.0}% of the link, prompt batches are crossing the bus", pcie_frac * 100.0),
+                    detail: format!(
+                        "{:.0}% of the link, prompt batches are crossing the bus",
+                        pcie_frac * 100.0
+                    ),
                 };
             }
             if max_gpu_util >= 60.0 {
                 return Verdict {
                     stage: Some(StageId::Prefill),
                     headline: "compute bound: prefill is matmul throughput".into(),
-                    detail: format!("GPU {:.0}% busy, memory controller {:.0}%", max_gpu_util, max_mem_busy),
+                    detail: format!(
+                        "GPU {:.0}% busy, memory controller {:.0}%",
+                        max_gpu_util, max_mem_busy
+                    ),
                 };
             }
             if cpu_side {
@@ -322,12 +342,19 @@ mod tests {
             total_bytes: 25_000_000_000,
             expert_bytes: 0,
             embd_bytes: 1_000_000_000,
+            engram_bytes: 0,
             block_bytes: vec![],
             n_tensors: 1,
         });
         m.cmdline = "llama-server -ub 256".into();
         // Two cards holding 7.8 G and 11.8 G: 12.5 G share each, clamped.
-        let gpus = vec![gpu(0.0, 0.0, 7_800), GpuStats { index: 1, ..gpu(0.0, 0.0, 11_800) }];
+        let gpus = vec![
+            gpu(0.0, 0.0, 7_800),
+            GpuStats {
+                index: 1,
+                ..gpu(0.0, 0.0, 11_800)
+            },
+        ];
         let l = weight_layout(Some(&m), &gpus);
         assert!(l.known);
         assert_eq!(l.ubatch, 256);

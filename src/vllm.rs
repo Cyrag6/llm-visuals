@@ -422,11 +422,7 @@ mod tests {
         let c = parse_vllm_metrics(&body).expect("vllm: counters present");
         assert_eq!(c.model_name.as_deref(), Some("qwen38"));
         assert!(c.prompt_total > 0.0 && c.generation_total > 0.0);
-        assert_eq!(
-            c.spec_positions.len(),
-            4,
-            "MTP depth 4 expected"
-        );
+        assert_eq!(c.spec_positions.len(), 4, "MTP depth 4 expected");
         // The latency histograms the prefill/decode rates are computed
         // from (they do not move until completion).
         assert!(c.ttft_count > 0.0, "fixture carries the TTFT histogram");

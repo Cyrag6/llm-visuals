@@ -100,7 +100,11 @@ impl Renderer {
         SPINNER[((self.t() * 10.0) as usize) % SPINNER.len()]
     }
 
-    pub fn render_frame(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, d: &Dashboard) {
+    pub fn render_frame(
+        &self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        d: &Dashboard,
+    ) {
         let _ = terminal.try_draw(|frame: &mut Frame| -> Result<(), io::Error> {
             let area = frame.area();
             frame.render_widget(
@@ -170,7 +174,13 @@ impl Renderer {
         let show_requests = h >= 22;
         let show_ctx = h >= 16;
         let req_h = if show_requests { 7 } else { 0 };
-        let ctx_h = if !show_ctx { 0 } else if d.view == ViewMode::Perf { 6 } else { 4 };
+        let ctx_h = if !show_ctx {
+            0
+        } else if d.view == ViewMode::Perf {
+            6
+        } else {
+            4
+        };
 
         let constraints: Vec<Constraint> = match d.view {
             ViewMode::All => vec![
@@ -254,30 +264,48 @@ impl Renderer {
         } else {
             pal::c((10, 12, 18))
         };
-        let spinner = if phase == Phase::Idle { "●" } else { self.spinner() };
+        let spinner = if phase == Phase::Idle {
+            "●"
+        } else {
+            self.spinner()
+        };
         let mut right_spans: Vec<Span> = Vec::new();
         if d.models.len() > 1 {
             right_spans.push(Span::styled(
                 format!(" model {}/{} ", d.focus + 1, d.models.len()),
-                Style::default().fg(pal::c(pal::VIOLET)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal::c(pal::VIOLET))
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         let right = Line::from({
             right_spans.extend([
-            Span::styled(
-                format!(" {spinner} {badge_txt} "),
-                Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" up {}  {} ", fmt_clock(d.perf.uptime()), chrono::Local::now().format("%H:%M:%S")),
-                Style::default().fg(pal::c(pal::TEXT_DIM)),
-            ),
+                Span::styled(
+                    format!(" {spinner} {badge_txt} "),
+                    Style::default()
+                        .fg(badge_fg)
+                        .bg(badge_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " up {}  {} ",
+                        fmt_clock(d.perf.uptime()),
+                        chrono::Local::now().format("%H:%M:%S")
+                    ),
+                    Style::default().fg(pal::c(pal::TEXT_DIM)),
+                ),
             ]);
             right_spans
         })
         .right_aligned();
 
-        let (block, _) = with_right(panel(" ◆ LLM VISUALS ", pal::CYAN), " ◆ LLM VISUALS ", right, area);
+        let (block, _) = with_right(
+            panel(" ◆ LLM VISUALS ", pal::CYAN),
+            " ◆ LLM VISUALS ",
+            right,
+            area,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -287,7 +315,9 @@ impl Renderer {
             Some(m) => {
                 spans.push(Span::styled(
                     format!(" {}", m.name),
-                    Style::default().fg(pal::c(pal::WHITE)).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(pal::c(pal::WHITE))
+                        .add_modifier(Modifier::BOLD),
                 ));
                 spans.push(sep());
                 spans.push(Span::styled(
@@ -327,6 +357,13 @@ impl Renderer {
                             Style::default().fg(pal::c(pal::AMBER)),
                         ));
                     }
+                    if let Some(e) = &g.engram {
+                        spans.push(sep());
+                        spans.push(Span::styled(
+                            format!("engram {}-gram", e.ngram_size),
+                            Style::default().fg(pal::c(pal::VIOLET)),
+                        ));
+                    }
                 }
                 if let Some(q) = quant_from_path(m) {
                     spans.push(sep());
@@ -350,14 +387,18 @@ impl Renderer {
                     spans.push(sep());
                     spans.push(Span::styled(
                         "synthetic demo",
-                        Style::default().fg(pal::c(pal::AMBER)).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(pal::c(pal::AMBER))
+                            .add_modifier(Modifier::ITALIC),
                     ));
                 }
             }
             None => {
                 spans.push(Span::styled(
                     " no inference server detected",
-                    Style::default().fg(pal::c(pal::AMBER)).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(pal::c(pal::AMBER))
+                        .add_modifier(Modifier::BOLD),
                 ));
                 spans.push(sep());
                 spans.push(Span::styled(
@@ -411,7 +452,10 @@ impl Renderer {
         ];
         let unit_texts = [
             ("tok/s", pal::TEXT),
-            (if live { "DECODE" } else { "decode" }, if live { pal::CYAN } else { pal::TEXT_DIM }),
+            (
+                if live { "DECODE" } else { "decode" },
+                if live { pal::CYAN } else { pal::TEXT_DIM },
+            ),
             ("", pal::TEXT_DIM),
         ];
         for (row, glyph_row) in digits.iter().enumerate() {
@@ -434,11 +478,13 @@ impl Renderer {
             };
             spans.push(Span::styled(
                 format!("{ut:<12}"),
-                Style::default().fg(pal::c(uc)).add_modifier(if row == 1 && live {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
+                Style::default()
+                    .fg(pal::c(uc))
+                    .add_modifier(if row == 1 && live {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ));
             if stat_col + 18 <= w {
                 let (k, v, c) = &right_stats[row];
@@ -547,12 +593,18 @@ impl Renderer {
                 Paragraph::new(Line::from(vec![
                     Span::styled(
                         " no GPU telemetry ",
-                        Style::default().fg(pal::c(pal::AMBER)).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(pal::c(pal::AMBER))
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         match d.gpu_error {
-                            Some(e) => format!("— {}", truncate(e, inner.width.saturating_sub(20) as usize)),
-                            None => "— nvidia-smi returned nothing. --demo simulates two cards.".to_string(),
+                            Some(e) => format!(
+                                "— {}",
+                                truncate(e, inner.width.saturating_sub(20) as usize)
+                            ),
+                            None => "— nvidia-smi returned nothing. --demo simulates two cards."
+                                .to_string(),
                         },
                         Style::default().fg(pal::c(pal::TEXT_DIM)),
                     ),
@@ -578,7 +630,12 @@ impl Renderer {
     fn render_gpu_card(&self, frame: &mut Frame, area: Rect, g: &GpuStats, d: &Dashboard) {
         let w = area.width as usize;
         let gi = g.index as usize;
-        let util = d.fade.gpu.get(gi).copied().unwrap_or(g.utilization_gpu / 100.0);
+        let util = d
+            .fade
+            .gpu
+            .get(gi)
+            .copied()
+            .unwrap_or(g.utilization_gpu / 100.0);
         let util_peak = d.perf.util_peak.get(gi).map(|p| p.0);
         let pwr_peak = d.perf.power_peak.get(gi).map(|p| p.0);
         let mut lines: Vec<Line> = Vec::new();
@@ -590,7 +647,9 @@ impl Renderer {
         let mut tail: Vec<Span> = vec![
             Span::styled(
                 format!(" {:>3.0}%", util * 100.0),
-                Style::default().fg(pal::vu(util)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal::vu(util))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
         ];
@@ -635,7 +694,9 @@ impl Renderer {
         let bar_w = w.saturating_sub(fixed).clamp(4, 30);
         let mut spans = vec![Span::styled(
             name.clone(),
-            Style::default().fg(pal::c(pal::WHITE)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(pal::c(pal::WHITE))
+                .add_modifier(Modifier::BOLD),
         )];
         spans.extend(gauge(util, util_peak, bar_w, GaugeStyle::Vu));
         spans.extend(tail);
@@ -643,16 +704,17 @@ impl Renderer {
 
         // Line 2: VRAM segmented by weights / KV / other / free.
         if area.height >= 2 {
-            let used = d.fade.vram.get(gi).copied().unwrap_or(g.vram_percent() / 100.0);
+            let used = d
+                .fade
+                .vram
+                .get(gi)
+                .copied()
+                .unwrap_or(g.vram_percent() / 100.0);
             let weights = d.fade.weight_frac.get(gi).copied().unwrap_or(0.0).min(used);
             let kv = d.fade.kv_alloc_frac.get(gi).copied().unwrap_or(0.0);
             let kv_fill = d.fade.kv_frac;
             let label = format!("{:<12}", "   VRAM");
-            let txt = format!(
-                " {:>4.1}/{:<4.1}G ",
-                g.vram_gb(),
-                g.vram_total_gb()
-            );
+            let txt = format!(" {:>4.1}/{:<4.1}G ", g.vram_gb(), g.vram_total_gb());
             // With several models sharing the box, say which ones live here.
             let tenants: Vec<usize> = if d.models.len() > 1 {
                 d.models
@@ -664,32 +726,62 @@ impl Renderer {
             } else {
                 Vec::new()
             };
-            let tenant_w = if tenants.is_empty() { 0 } else { 2 + 2 * tenants.len() };
+            let tenant_w = if tenants.is_empty() {
+                0
+            } else {
+                2 + 2 * tenants.len()
+            };
             let legend_w = if w > 78 + tenant_w { 22 } else { 0 };
             let bar_w = w
                 .saturating_sub(label.len() + txt.len() + legend_w + tenant_w)
                 .clamp(4, 40);
-            let mut spans = vec![Span::styled(label, Style::default().fg(pal::c(pal::TEXT_DIM)))];
-            spans.extend(vram_bar(bar_w, used, weights, kv, kv_fill, d.fade.processing, self.pulse()));
+            let mut spans = vec![Span::styled(
+                label,
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            )];
+            spans.extend(vram_bar(
+                bar_w,
+                used,
+                weights,
+                kv,
+                kv_fill,
+                d.fade.processing,
+                self.pulse(),
+            ));
             spans.push(Span::styled(
                 txt,
-                Style::default().fg(pal::vu(used)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal::vu(used))
+                    .add_modifier(Modifier::BOLD),
             ));
             if !tenants.is_empty() {
-                spans.push(Span::styled("⟨", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                spans.push(Span::styled(
+                    "⟨",
+                    Style::default().fg(pal::c(pal::TEXT_MUTED)),
+                ));
                 for (k, i) in tenants.iter().enumerate() {
                     if k > 0 {
-                        spans.push(Span::styled(",", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                        spans.push(Span::styled(
+                            ",",
+                            Style::default().fg(pal::c(pal::TEXT_MUTED)),
+                        ));
                     }
                     let focused = *i == d.focus;
                     spans.push(Span::styled(
                         format!("{}", i + 1),
                         Style::default()
                             .fg(pal::c(if focused { pal::CYAN } else { pal::TEXT_DIM }))
-                            .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
+                            .add_modifier(if focused {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ));
                 }
-                spans.push(Span::styled("⟩ ", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                spans.push(Span::styled(
+                    "⟩ ",
+                    Style::default().fg(pal::c(pal::TEXT_MUTED)),
+                ));
             }
             if legend_w > 0 {
                 spans.push(Span::styled("■", Style::default().fg(pal::c(pal::BLUE))));
@@ -725,7 +817,13 @@ impl Renderer {
                 .map(|h| h.iter().copied().collect())
                 .unwrap_or_default();
             let u_rows = sparkline(&util_h, left_w, spark_rows, 100.0, pal::VU);
-            let p_rows = sparkline(&pwr_h, right_w, spark_rows, g.power_max_watts.max(1.0), pal::PREFILL);
+            let p_rows = sparkline(
+                &pwr_h,
+                right_w,
+                spark_rows,
+                g.power_max_watts.max(1.0),
+                pal::PREFILL,
+            );
             for (i, (u, pw)) in u_rows.into_iter().zip(p_rows).enumerate() {
                 let mut spans = vec![Span::raw(" ".repeat(label_w))];
                 spans.extend(u);
@@ -749,7 +847,12 @@ impl Renderer {
         let frac = used as f32 / ctx_max as f32;
         let cached = d.live.cache_tokens.min(used);
         let prompt = d.live.prompt_tokens.min(used).saturating_sub(cached);
-        let title = format!(" ◆ CONTEXT  {} / {}  {:.1}% ", fmt_int(used), fmt_int(ctx_max), frac * 100.0);
+        let title = format!(
+            " ◆ CONTEXT  {} / {}  {:.1}% ",
+            fmt_int(used),
+            fmt_int(ctx_max),
+            frac * 100.0
+        );
         // Fact items, most useful first; trailing ones are shed when space is short.
         let mut items: Vec<Span> = Vec::new();
         if d.live.prompt_tokens > 0 {
@@ -775,21 +878,28 @@ impl Renderer {
         }
         if let Some(m) = d.detected {
             if cmd_arg(&m.cmdline, "--flash-attn").is_some() || m.cmdline.contains(" -fa") {
-                items.push(Span::styled("flash-attn", Style::default().fg(pal::c(pal::TEXT))));
+                items.push(Span::styled(
+                    "flash-attn",
+                    Style::default().fg(pal::c(pal::TEXT)),
+                ));
             }
         }
         let join = |n: usize| -> Line<'static> {
             let mut out: Vec<Span<'static>> = Vec::new();
             for (i, it) in items.iter().take(n).enumerate() {
                 if i > 0 {
-                    out.push(Span::styled(" · ", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                    out.push(Span::styled(
+                        " · ",
+                        Style::default().fg(pal::c(pal::TEXT_MUTED)),
+                    ));
                 }
                 out.push(it.clone());
             }
             Line::from(out)
         };
         let all = join(items.len());
-        let (block, facts_in_title) = with_right(panel(&title, pal::TEAL), &title, all.right_aligned(), area);
+        let (block, facts_in_title) =
+            with_right(panel(&title, pal::TEAL), &title, all.right_aligned(), area);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height == 0 || inner.width < 10 {
@@ -803,7 +913,11 @@ impl Renderer {
             fmt_int(d.live.decoded)
         );
         let two_lines = inner.height >= 2;
-        let legend_w = if two_lines || w <= 70 { 0 } else { legend.chars().count() };
+        let legend_w = if two_lines || w <= 70 {
+            0
+        } else {
+            legend.chars().count()
+        };
         let bar_w = w.saturating_sub(legend_w + 1).max(8);
         let mut spans: Vec<Span> = Vec::with_capacity(w);
         let cells = bar_w * 2; // half-cell precision
@@ -820,7 +934,11 @@ impl Renderer {
                 } else if i < n_cached {
                     Some(pal::VIOLET)
                 } else if i < n_cached + n_prompt {
-                    Some(pal::lerp_rgb(pal::BLUE, pal::CYAN, i as f32 / cells.max(1) as f32))
+                    Some(pal::lerp_rgb(
+                        pal::BLUE,
+                        pal::CYAN,
+                        i as f32 / cells.max(1) as f32,
+                    ))
                 } else {
                     Some(pal::GREEN)
                 }
@@ -900,7 +1018,9 @@ impl Renderer {
         let spec_type = if !d.live.spec_types.is_empty() {
             d.live.spec_types.trim_start_matches("none,").to_string()
         } else {
-            d.detected.and_then(|m| m.spec_type.clone()).unwrap_or_default()
+            d.detected
+                .and_then(|m| m.spec_type.clone())
+                .unwrap_or_default()
         };
         let depth = d
             .detected
@@ -936,7 +1056,9 @@ impl Renderer {
         if !sp.available {
             let mut facts: Vec<Span> = vec![Span::styled(
                 "drafting on",
-                Style::default().fg(pal::c(pal::GREEN)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal::c(pal::GREEN))
+                    .add_modifier(Modifier::BOLD),
             )];
             if let Some(m) = d.detected {
                 if let Some(k) = cmd_arg(&m.cmdline, "--cache-type-k") {
@@ -945,7 +1067,9 @@ impl Renderer {
                         Style::default().fg(pal::c(pal::TEAL)),
                     ));
                 }
-                if let Some(n) = cmd_arg(&m.cmdline, "--draft-max").or_else(|| cmd_arg(&m.cmdline, "--draft")) {
+                if let Some(n) =
+                    cmd_arg(&m.cmdline, "--draft-max").or_else(|| cmd_arg(&m.cmdline, "--draft"))
+                {
                     facts.push(Span::styled(
                         format!("  ·  draft max {n}"),
                         Style::default().fg(pal::c(pal::TEXT)),
@@ -978,15 +1102,25 @@ impl Renderer {
         let bar_w = w
             .saturating_sub(label.len() + rate_txt.len() + tail.len())
             .clamp(6, 40);
-        let mut spans = vec![Span::styled(label, Style::default().fg(pal::c(pal::TEXT_DIM)))];
+        let mut spans = vec![Span::styled(
+            label,
+            Style::default().fg(pal::c(pal::TEXT_DIM)),
+        )];
         spans.extend(gauge(sp.accept_rate, None, bar_w, GaugeStyle::Flow));
         spans.push(Span::styled(
             rate_txt,
             Style::default()
-                .fg(if live { pal::gradient_color(pal::FLOW, sp.accept_rate) } else { pal::c(pal::TEXT_MUTED) })
+                .fg(if live {
+                    pal::gradient_color(pal::FLOW, sp.accept_rate)
+                } else {
+                    pal::c(pal::TEXT_MUTED)
+                })
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(tail, Style::default().fg(pal::c(pal::TEXT_DIM))));
+        spans.push(Span::styled(
+            tail,
+            Style::default().fg(pal::c(pal::TEXT_DIM)),
+        ));
         lines.push(Line::from(spans));
 
         // Remaining lines: acceptance history, with session totals at the right.
@@ -1005,19 +1139,34 @@ impl Renderer {
             let own_line = !beside && rows >= 3;
             let session_w = if beside { session.len() } else { 0 };
             let rows = if own_line { rows - 1 } else { rows };
-            let spark = sparkline(&hist, w.saturating_sub(label_w + session_w), rows, 1.0, pal::FLOW);
+            let spark = sparkline(
+                &hist,
+                w.saturating_sub(label_w + session_w),
+                rows,
+                1.0,
+                pal::FLOW,
+            );
             for (i, r) in spark.into_iter().enumerate() {
                 let lab = if i == 0 {
-                    Span::styled(format!("{:<7}", "history"), Style::default().fg(pal::c(pal::TEXT_DIM)))
+                    Span::styled(
+                        format!("{:<7}", "history"),
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    )
                 } else if i == rows - 1 {
-                    Span::styled(format!("{:<7}", "100%"), Style::default().fg(pal::c(pal::TEXT_MUTED)))
+                    Span::styled(
+                        format!("{:<7}", "100%"),
+                        Style::default().fg(pal::c(pal::TEXT_MUTED)),
+                    )
                 } else {
                     Span::raw(" ".repeat(label_w))
                 };
                 let mut sp_row = vec![lab];
                 sp_row.extend(r);
                 if session_w > 0 && i == rows - 1 {
-                    sp_row.push(Span::styled(session.clone(), Style::default().fg(pal::c(pal::TEXT_DIM))));
+                    sp_row.push(Span::styled(
+                        session.clone(),
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    ));
                 }
                 lines.push(Line::from(sp_row));
             }
@@ -1043,7 +1192,10 @@ impl Renderer {
         let f = d.fade;
         let n = f.n_layers;
         let n_gpus = d.gpus.len().max(1);
-        let title = format!(" ◆ LAYERS  {n} across {n_gpus} GPU{} ", if n_gpus > 1 { "s" } else { "" });
+        let title = format!(
+            " ◆ LAYERS  {n} across {n_gpus} GPU{} ",
+            if n_gpus > 1 { "s" } else { "" }
+        );
         let right = Line::from(Span::styled(
             format!(" theme {} ", self.theme.name),
             Style::default().fg(pal::c(pal::TEXT_MUTED)),
@@ -1078,7 +1230,11 @@ impl Renderer {
             let base = self.theme.map_rgb(level);
             let bg_rgb = pal::dim_rgb(base, 0.55 + 0.35 * level);
             let bg = pal::c(bg_rgb);
-            let fg_text = if level > 0.5 { pal::c((10, 12, 18)) } else { pal::c(pal::TEXT) };
+            let fg_text = if level > 0.5 {
+                pal::c((10, 12, 18))
+            } else {
+                pal::c(pal::TEXT)
+            };
             let tag_col = pal::c(gpu_tags[gpu % gpu_tags.len()]);
             let inner_w = tw.saturating_sub(1); // 1-col gutter between tiles
             for dy in 0..th {
@@ -1105,13 +1261,13 @@ impl Renderer {
                         let ch = label.chars().nth(dx).unwrap_or(' ');
                         Span::styled(
                             ch.to_string(),
-                            Style::default().fg(fg_text).bg(bg).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(fg_text)
+                                .bg(bg)
+                                .add_modifier(Modifier::BOLD),
                         )
                     } else if dy == 0 && dx == inner_w - 1 && inner_w >= 5 {
-                        Span::styled(
-                            format!("{gpu}"),
-                            Style::default().fg(tag_col).bg(bg),
-                        )
+                        Span::styled(format!("{gpu}"), Style::default().fg(tag_col).bg(bg))
                     } else if bottom && !hist.is_empty() {
                         let n_h = hist.len();
                         let start = n_h.saturating_sub(inner_w);
@@ -1166,7 +1322,10 @@ impl Renderer {
                         Style::default().fg(pal::c(pal::TEXT_DIM)),
                     )];
                     for &v in &grid[l][hd] {
-                        spans.push(Span::styled(" ", Style::default().bg(self.theme.map_intensity(v))));
+                        spans.push(Span::styled(
+                            " ",
+                            Style::default().bg(self.theme.map_intensity(v)),
+                        ));
                     }
                     lines.push(Line::from(spans));
                 }
@@ -1179,7 +1338,11 @@ impl Renderer {
                 let l0 = vis * per_row;
                 let l1 = (l0 + per_row).min(layers);
                 let mut spans = vec![Span::styled(
-                    if per_row == 1 { format!("L{l0:<5} ") } else { format!("L{l0:<2}-{l1:<2} ") },
+                    if per_row == 1 {
+                        format!("L{l0:<5} ")
+                    } else {
+                        format!("L{l0:<2}-{l1:<2} ")
+                    },
                     Style::default().fg(pal::c(pal::TEXT_DIM)),
                 )];
                 for t in 0..n_tokens {
@@ -1189,9 +1352,15 @@ impl Renderer {
                             m = m.max(grid[l][hd][t]);
                         }
                     }
-                    spans.push(Span::styled(" ", Style::default().bg(self.theme.map_intensity(m))));
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().bg(self.theme.map_intensity(m)),
+                    ));
                 }
-                spans.push(Span::styled(" │ ", Style::default().fg(pal::c(pal::TEXT_MUTED))));
+                spans.push(Span::styled(
+                    " │ ",
+                    Style::default().fg(pal::c(pal::TEXT_MUTED)),
+                ));
                 for hd in 0..heads {
                     let mut m = 0.0f32;
                     for l in l0..l1 {
@@ -1199,7 +1368,10 @@ impl Renderer {
                             m = m.max(grid[l][hd][t]);
                         }
                     }
-                    spans.push(Span::styled(" ", Style::default().bg(self.theme.map_intensity(m))));
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().bg(self.theme.map_intensity(m)),
+                    ));
                 }
                 lines.push(Line::from(spans));
             }
@@ -1273,7 +1445,10 @@ impl Renderer {
             t
         };
         let legend = Line::from(vec![
-            Span::styled(" colour = time since routed  ", Style::default().fg(pal::c(pal::TEXT_MUTED))),
+            Span::styled(
+                " colour = time since routed  ",
+                Style::default().fg(pal::c(pal::TEXT_MUTED)),
+            ),
             Span::styled("█", Style::default().fg(self.theme.map_intensity(1.0))),
             Span::styled("█", Style::default().fg(self.theme.map_intensity(0.6))),
             Span::styled("█", Style::default().fg(self.theme.map_intensity(0.3))),
@@ -1282,8 +1457,23 @@ impl Renderer {
         ])
         .right_aligned();
         let (block, _) = with_right(panel(&title, pal::VIOLET), &title, legend, area);
-        let inner = block.inner(area);
+        let mut inner = block.inner(area);
         frame.render_widget(block, area);
+        // Engram (hashed n-gram memory) sits beside the experts: one lookup
+        // per token rather than a routed matmul, so it gets a line, not a grid.
+        let model = d.detected;
+        let engram = model
+            .and_then(|m| m.gguf.as_ref())
+            .and_then(|g| g.engram.as_ref());
+        if let (Some(e), true) = (engram, inner.height >= 2) {
+            let table_bytes = model
+                .and_then(|m| m.tensors.as_ref())
+                .map(|t| t.engram_bytes)
+                .unwrap_or(0);
+            let row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+            inner.height -= 1;
+            frame.render_widget(self.engram_line(e, table_bytes, row.width as usize), row);
+        }
         if !is_moe || n_l == 0 || inner.width < 8 || inner.height < 1 {
             frame.render_widget(
                 Paragraph::new(if is_moe {
@@ -1344,6 +1534,55 @@ impl Renderer {
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
     }
 
+    /// One line describing an engram module: what it hashes, where it is
+    /// injected, and how big the table is. Drops detail from the right on
+    /// narrow panels.
+    fn engram_line(
+        &self,
+        e: &crate::gguf::Engram,
+        table_bytes: u64,
+        width: usize,
+    ) -> Paragraph<'static> {
+        let layers = if e.layers.is_empty() {
+            "layer ?".to_string()
+        } else {
+            let list = e
+                .layers
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("layer{} {list}", if e.layers.len() > 1 { "s" } else { "" })
+        };
+        let mut parts = vec![
+            format!("hashed {}-gram memory", e.ngram_size),
+            layers,
+            format!("{} heads", e.n_heads()),
+        ];
+        if e.n_slots > 0 {
+            parts.push(format!("{} slots × {}d", fmt_count(e.n_slots), e.dim));
+        }
+        if table_bytes > 0 {
+            parts.push(format!("{:.1} GB table", table_bytes as f64 / 1e9));
+        }
+        parts.push("1 lookup/token, not routed".to_string());
+        let label = " ◆ ENGRAM  ";
+        let mut body = parts.join(" · ");
+        while label.len() + body.chars().count() > width && parts.len() > 1 {
+            parts.pop();
+            body = parts.join(" · ");
+        }
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(pal::c(pal::VIOLET))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(body, Style::default().fg(pal::c(pal::TEXT))),
+        ]))
+    }
+
     // -----------------------------------------------------------------------
     // Requests
     // -----------------------------------------------------------------------
@@ -1371,7 +1610,9 @@ impl Renderer {
         };
         let mut lines = vec![Line::from(Span::styled(
             header,
-            Style::default().fg(pal::c(pal::TEXT_MUTED)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(pal::c(pal::TEXT_MUTED))
+                .add_modifier(Modifier::BOLD),
         ))];
         let now = Instant::now();
         let rows = p.recent_requests(inner.height.saturating_sub(1) as usize);
@@ -1391,7 +1632,10 @@ impl Renderer {
         let live = r.is_live();
         let mark = if live {
             let k = 0.5 + 0.5 * self.pulse();
-            Span::styled(" ● ", Style::default().fg(pal::c(pal::dim_rgb(pal::CYAN, k))))
+            Span::styled(
+                " ● ",
+                Style::default().fg(pal::c(pal::dim_rgb(pal::CYAN, k))),
+            )
         } else {
             Span::styled(" ○ ", Style::default().fg(pal::c(pal::TEXT_MUTED)))
         };
@@ -1406,7 +1650,9 @@ impl Renderer {
             pal::gradient_color(pal::FLOW, (dec / peak.max(1.0)).clamp(0.0, 1.0))
         };
         let base = if live {
-            Style::default().fg(pal::c(pal::TEXT)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(pal::c(pal::TEXT))
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(pal::c(pal::TEXT_DIM))
         };
@@ -1414,8 +1660,14 @@ impl Renderer {
         let dur = fmt_dur(r.duration(now));
         let mut spans = vec![mark];
         if wide {
-            spans.push(Span::styled(format!("{:<8}", format!("#{}", r.id_task)), base));
-            spans.push(Span::styled(format!("{:>9}", fmt_int(r.prompt_tokens)), base));
+            spans.push(Span::styled(
+                format!("{:<8}", format!("#{}", r.id_task)),
+                base,
+            ));
+            spans.push(Span::styled(
+                format!("{:>9}", fmt_int(r.prompt_tokens)),
+                base,
+            ));
             spans.push(Span::styled(
                 format!("{:>9}", fmt_int(r.cached_tokens)),
                 Style::default().fg(pal::c(pal::VIOLET)),
@@ -1428,18 +1680,36 @@ impl Renderer {
                 format!("{:>14}", fmt_rate(r.avg_prefill_tps())),
                 Style::default().fg(pal::c(pal::MAGENTA)),
             ));
-            spans.push(Span::styled(format!("{:>13}", fmt_rate(dec)), Style::default().fg(dec_col)));
-            spans.push(Span::styled(format!("{:>9}", ttft), Style::default().fg(pal::c(pal::AMBER))));
+            spans.push(Span::styled(
+                format!("{:>13}", fmt_rate(dec)),
+                Style::default().fg(dec_col),
+            ));
+            spans.push(Span::styled(
+                format!("{:>9}", ttft),
+                Style::default().fg(pal::c(pal::AMBER)),
+            ));
             spans.push(Span::styled(format!("{:>9}", dur), base));
         } else {
-            spans.push(Span::styled(format!("{:<7}", format!("#{}", r.id_task)), base));
-            spans.push(Span::styled(format!("{:>8}", fmt_int(r.prompt_tokens)), base));
+            spans.push(Span::styled(
+                format!("{:<7}", format!("#{}", r.id_task)),
+                base,
+            ));
+            spans.push(Span::styled(
+                format!("{:>8}", fmt_int(r.prompt_tokens)),
+                base,
+            ));
             spans.push(Span::styled(
                 format!("{:>7}", fmt_int(r.decoded)),
                 Style::default().fg(pal::c(pal::GREEN)),
             ));
-            spans.push(Span::styled(format!("{:>11}", fmt_rate(dec)), Style::default().fg(dec_col)));
-            spans.push(Span::styled(format!("{:>8}", ttft), Style::default().fg(pal::c(pal::AMBER))));
+            spans.push(Span::styled(
+                format!("{:>11}", fmt_rate(dec)),
+                Style::default().fg(dec_col),
+            ));
+            spans.push(Span::styled(
+                format!("{:>8}", ttft),
+                Style::default().fg(pal::c(pal::AMBER)),
+            ));
             spans.push(Span::styled(format!("{:>8}", dur), base));
         }
         Line::from(spans)
@@ -1518,7 +1788,10 @@ impl Renderer {
             );
             let pad = free.saturating_sub(status.chars().count());
             spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(status, Style::default().fg(pal::c(pal::TEXT_MUTED))));
+            spans.push(Span::styled(
+                status,
+                Style::default().fg(pal::c(pal::TEXT_MUTED)),
+            ));
         }
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(pal::c(pal::PANEL))),
@@ -1608,7 +1881,9 @@ impl Renderer {
         for (k, label) in keys {
             spans.push(Span::styled(
                 format!(" {k}"),
-                Style::default().fg(pal::c(pal::TEXT)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal::c(pal::TEXT))
+                    .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(format!(" {label} "), dim));
         }
@@ -1636,7 +1911,11 @@ impl Renderer {
     /// narrows, so the index and the rate always survive.
     fn render_models_bar(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let n = d.models.len();
-        let busy = d.models.iter().filter(|m| m.perf.phase != Phase::Idle).count();
+        let busy = d
+            .models
+            .iter()
+            .filter(|m| m.perf.phase != Phase::Idle)
+            .count();
         let title = format!(" ◆ MODELS  {n} ");
         let right = Line::from(vec![
             Span::styled(
@@ -1657,7 +1936,11 @@ impl Renderer {
         }
         // Scroll so the focused model is always on screen.
         let rows = inner.height as usize;
-        let start = if d.focus >= rows { d.focus + 1 - rows } else { 0 };
+        let start = if d.focus >= rows {
+            d.focus + 1 - rows
+        } else {
+            0
+        };
         let lines: Vec<Line> = d
             .models
             .iter()
@@ -1674,7 +1957,9 @@ impl Renderer {
         let p = m.perf;
         let (badge_rgb, badge) = phase_badge(p.phase);
         let name_style = if focused {
-            Style::default().fg(pal::c(pal::WHITE)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(pal::c(pal::WHITE))
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(pal::c(pal::TEXT))
         };
@@ -1709,7 +1994,11 @@ impl Renderer {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:<w$} ", truncate(&m.detected.short_name(), name_w), w = name_w),
+                format!(
+                    "{:<w$} ",
+                    truncate(&m.detected.short_name(), name_w),
+                    w = name_w
+                ),
                 name_style,
             ),
         ];
@@ -1820,7 +2109,14 @@ impl Renderer {
         let p = m.perf;
         let focused = i == d.focus;
         let (badge_rgb, badge) = phase_badge(p.phase);
-        let title = format!(" {} {} ", i + 1, truncate(&m.detected.short_name(), area.width.saturating_sub(8) as usize));
+        let title = format!(
+            " {} {} ",
+            i + 1,
+            truncate(
+                &m.detected.short_name(),
+                area.width.saturating_sub(8) as usize
+            )
+        );
         let accent = if focused { pal::CYAN } else { pal::BORDER };
         let mut block = panel(&title, if focused { pal::WHITE } else { pal::TEXT_DIM });
         if focused {
@@ -1838,12 +2134,20 @@ impl Renderer {
         let muted = Style::default().fg(pal::c(pal::TEXT_MUTED));
 
         // Phase badge + engine.
-        let glow = if p.phase == Phase::Idle { 0.55 } else { 0.75 + 0.35 * self.pulse() };
+        let glow = if p.phase == Phase::Idle {
+            0.55
+        } else {
+            0.75 + 0.35 * self.pulse()
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!(" {} ", badge.to_uppercase()),
                 Style::default()
-                    .fg(pal::c(if p.phase == Phase::Idle { pal::TEXT_DIM } else { (10, 12, 18) }))
+                    .fg(pal::c(if p.phase == Phase::Idle {
+                        pal::TEXT_DIM
+                    } else {
+                        (10, 12, 18)
+                    }))
                     .bg(pal::c(pal::dim_rgb(badge_rgb, glow)))
                     .add_modifier(Modifier::BOLD),
             ),
@@ -1953,7 +2257,11 @@ impl Renderer {
                     pal::VIOLET,
                 ));
             }
-            lines.push(kv("shape", format!("{}L × {}H", g.n_layers, g.n_heads), pal::TEXT));
+            lines.push(kv(
+                "shape",
+                format!("{}L × {}H", g.n_layers, g.n_heads),
+                pal::TEXT,
+            ));
         }
         lines.push(kv(
             "vram",
@@ -1974,7 +2282,11 @@ impl Renderer {
         }
         lines.push(kv(
             "session",
-            format!("{} req · {} gen", p.session_requests, fmt_compact(p.session_decoded as f32)),
+            format!(
+                "{} req · {} gen",
+                p.session_requests,
+                fmt_compact(p.session_decoded as f32)
+            ),
             pal::TEXT_DIM,
         ));
 
@@ -2056,7 +2368,10 @@ struct Stage<'a> {
 
 impl<'a> Stage<'a> {
     fn activity(&self) -> f32 {
-        self.channels.iter().map(|c| c.meter.frac()).fold(0.0, f32::max)
+        self.channels
+            .iter()
+            .map(|c| c.meter.frac())
+            .fold(0.0, f32::max)
     }
 }
 
@@ -2065,7 +2380,8 @@ impl Renderer {
         let bw = &d.perf.bw;
         let host = &bw.host;
         let layout = &bw.layout;
-        let dim = |s: String| Line::from(Span::styled(s, Style::default().fg(pal::c(pal::TEXT_DIM))));
+        let dim =
+            |s: String| Line::from(Span::styled(s, Style::default().fg(pal::c(pal::TEXT_DIM))));
         let fact = |k: &str, v: String, c: (u8, u8, u8)| {
             Line::from(vec![
                 Span::styled(format!("{k} "), Style::default().fg(pal::c(pal::TEXT_DIM))),
@@ -2076,11 +2392,19 @@ impl Renderer {
         let mut stages: Vec<Stage> = Vec::with_capacity(6);
 
         // ---- disk ---------------------------------------------------------
-        let mut facts = vec![fact("proc", format!("{:.0} MB/s", bw.proc_disk_mb_s), pal::TEXT)];
+        let mut facts = vec![fact(
+            "proc",
+            format!("{:.0} MB/s", bw.proc_disk_mb_s),
+            pal::TEXT,
+        )];
         facts.push(fact(
             "faults",
             format!("{:.0}/s", bw.majflt_per_s),
-            if bw.majflt_per_s > 50.0 { pal::AMBER } else { pal::TEXT },
+            if bw.majflt_per_s > 50.0 {
+                pal::AMBER
+            } else {
+                pal::TEXT
+            },
         ));
         if layout.known {
             facts.push(fact("model", gb(layout.total_bytes), pal::TEXT));
@@ -2111,7 +2435,11 @@ impl Renderer {
             facts.push(fact("resident", gb(r), pal::VIOLET));
         }
         if layout.known {
-            let c = if layout.cpu_bytes > layout.total_bytes / 50 { pal::AMBER } else { pal::TEXT_DIM };
+            let c = if layout.cpu_bytes > layout.total_bytes / 50 {
+                pal::AMBER
+            } else {
+                pal::TEXT_DIM
+            };
             facts.push(fact("cpu-side", format!("~{}", gb(layout.cpu_bytes)), c));
         }
         if let Some(a) = host.mem_available_bytes {
@@ -2130,7 +2458,11 @@ impl Renderer {
                 text: fmt_compact(bw.ram.value),
             }],
             facts,
-            missing: if layout.known { None } else { Some("no tensor table".into()) },
+            missing: if layout.known {
+                None
+            } else {
+                Some("no tensor table".into())
+            },
         });
 
         // ---- PCIe ---------------------------------------------------------
@@ -2150,7 +2482,11 @@ impl Renderer {
                     .full_scale
                     .map(|c| format!("{:.1}G/s", c / 1000.0))
                     .unwrap_or_else(|| "?".into());
-                facts.push(fact(&format!("G{i}"), format!("x{} g{} {cap}", g.pcie_width, g.pcie_gen), pal::TEXT));
+                facts.push(fact(
+                    &format!("G{i}"),
+                    format!("x{} g{} {cap}", g.pcie_width, g.pcie_gen),
+                    pal::TEXT,
+                ));
             }
         }
         stages.push(Stage {
@@ -2187,7 +2523,11 @@ impl Renderer {
                 });
             }
         }
-        let mut facts = vec![fact("weights", format!("{:.1} GB/s", bw.vram.value), pal::TEAL)];
+        let mut facts = vec![fact(
+            "weights",
+            format!("{:.1} GB/s", bw.vram.value),
+            pal::TEAL,
+        )];
         if layout.known {
             facts.push(fact("per step", gb(layout.per_step().1 as u64), pal::TEXT));
         }
@@ -2201,7 +2541,11 @@ impl Renderer {
             tag: "busy",
             channels,
             facts,
-            missing: if d.gpus.is_empty() { Some("no GPU".into()) } else { None },
+            missing: if d.gpus.is_empty() {
+                Some("no GPU".into())
+            } else {
+                None
+            },
         });
 
         // ---- prefill ------------------------------------------------------
@@ -2230,7 +2574,11 @@ impl Renderer {
         // ---- decode -------------------------------------------------------
         let mut facts = vec![fact("peak", fmt_rate(p.peak_decode_tps), pal::TEXT)];
         if p.spec.available {
-            facts.push(fact("steps", format!("{:.1}/s", p.spec.steps_per_sec), pal::AMBER));
+            facts.push(fact(
+                "steps",
+                format!("{:.1}/s", p.spec.steps_per_sec),
+                pal::AMBER,
+            ));
         }
         if layout.known {
             facts.push(fact("per tok", gb(layout.active_bytes), pal::TEXT));
@@ -2259,7 +2607,10 @@ impl Renderer {
         let right_txt = if layout.known {
             format!(
                 " {} tensors · {:.1} GB · {:.1} GB per step · {}",
-                d.detected.and_then(|m| m.tensors.as_ref()).map(|t| t.n_tensors).unwrap_or(0),
+                d.detected
+                    .and_then(|m| m.tensors.as_ref())
+                    .map(|t| t.n_tensors)
+                    .unwrap_or(0),
                 layout.total_bytes as f32 / 1e9,
                 layout.active_bytes as f32 / 1e9,
                 if layout.cpu_bytes > layout.total_bytes / 50 {
@@ -2271,7 +2622,11 @@ impl Renderer {
         } else {
             " no GGUF tensor table: RAM / VRAM streams unknown ".into()
         };
-        let right = Line::from(Span::styled(right_txt, Style::default().fg(pal::c(pal::TEXT_DIM)))).right_aligned();
+        let right = Line::from(Span::styled(
+            right_txt,
+            Style::default().fg(pal::c(pal::TEXT_DIM)),
+        ))
+        .right_aligned();
         let (block, _) = with_right(panel(title, pal::CYAN), title, right, area);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -2297,7 +2652,12 @@ impl Renderer {
         let col_w = (w - gutter * (n - 1)) / n;
         // Row plan shared by every column so the arrows line up.
         let h = inner.height as usize;
-        let facts_h = stages.iter().map(|s| s.facts.len()).max().unwrap_or(0).min(3);
+        let facts_h = stages
+            .iter()
+            .map(|s| s.facts.len())
+            .max()
+            .unwrap_or(0)
+            .min(3);
         let facts_h = if h >= 12 { facts_h } else { 0 };
         let label_rows = 2;
         let meter_h = h.saturating_sub(3 + label_rows + facts_h).max(3);
@@ -2321,7 +2681,11 @@ impl Renderer {
                 } else {
                     "▶"
                 };
-                let col = if active { pal::c(st.accent) } else { pal::c(pal::TEXT_MUTED) };
+                let col = if active {
+                    pal::c(st.accent)
+                } else {
+                    pal::c(pal::TEXT_MUTED)
+                };
                 frame.render_widget(
                     Paragraph::new(Span::styled(arrow, Style::default().fg(col))),
                     Rect::new(gx, gy, gutter as u16, 1),
@@ -2347,7 +2711,11 @@ impl Renderer {
         // Title, inverted and glowing when this stage is the bound.
         if flagged {
             let glow = 0.7 + 0.3 * self.pulse();
-            let txt = if w >= 16 { format!(" {} ◀ BOUND ", st.title) } else { format!(" {} ◀", st.title) };
+            let txt = if w >= 16 {
+                format!(" {} ◀ BOUND ", st.title)
+            } else {
+                format!(" {} ◀", st.title)
+            };
             lines.push(Line::from(Span::styled(
                 txt,
                 Style::default()
@@ -2358,7 +2726,9 @@ impl Renderer {
         } else {
             lines.push(Line::from(Span::styled(
                 format!(" {}", st.title),
-                Style::default().fg(pal::c(st.accent)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal::c(st.accent))
+                    .add_modifier(Modifier::BOLD),
             )));
         }
         // Reading.
@@ -2367,16 +2737,25 @@ impl Renderer {
             Span::styled(
                 format!(" {}", st.value),
                 Style::default()
-                    .fg(if live { pal::c(pal::WHITE) } else { pal::c(pal::TEXT_MUTED) })
+                    .fg(if live {
+                        pal::c(pal::WHITE)
+                    } else {
+                        pal::c(pal::TEXT_MUTED)
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {}", st.unit), Style::default().fg(pal::c(pal::TEXT_DIM))),
+            Span::styled(
+                format!(" {}", st.unit),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ),
         ];
         let reading_w: usize = spans.iter().map(|x| x.content.chars().count()).sum();
         if !st.tag.is_empty() && reading_w + st.tag.len() + 1 <= w {
             spans.push(Span::styled(
                 format!(" {}", st.tag),
-                Style::default().fg(pal::c(pal::TEXT_MUTED)).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(pal::c(pal::TEXT_MUTED))
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
         lines.push(Line::from(spans));
@@ -2387,11 +2766,11 @@ impl Renderer {
         let n_ch = st.channels.len().max(1);
         let avail = w.saturating_sub(tick_w + 1);
         let bar_w = ((avail + 1) / n_ch).saturating_sub(1).clamp(1, 6);
-        let shared_scale = st
-            .channels
-            .first()
-            .map(|c| c.meter.scale())
-            .filter(|s| st.channels.iter().all(|c| (c.meter.scale() - s).abs() < 1e-3));
+        let shared_scale = st.channels.first().map(|c| c.meter.scale()).filter(|s| {
+            st.channels
+                .iter()
+                .all(|c| (c.meter.scale() - s).abs() < 1e-3)
+        });
         let pct_ticks = shared_scale.is_none() || st.unit == "%";
         let top = meter_h.saturating_sub(1);
         let tick_at = |t: f32| -> usize { top - ((t * top as f32).round() as usize).min(top) };
@@ -2462,8 +2841,15 @@ impl Renderer {
                 Style::default().fg(pal::c(pal::TEXT_DIM)),
             ));
             let t: String = c.text.chars().take(cell).collect();
-            let col = if c.meter.frac() > 0.0 { pal::vu(c.meter.frac()) } else { pal::c(pal::TEXT_MUTED) };
-            val.push(Span::styled(format!("{t:<cell$}"), Style::default().fg(col)));
+            let col = if c.meter.frac() > 0.0 {
+                pal::vu(c.meter.frac())
+            } else {
+                pal::c(pal::TEXT_MUTED)
+            };
+            val.push(Span::styled(
+                format!("{t:<cell$}"),
+                Style::default().fg(col),
+            ));
         }
         if st.missing.is_none() {
             lines.push(Line::from(lab));
@@ -2521,7 +2907,9 @@ impl Renderer {
                 mark,
                 Span::styled(
                     truncate(&v.headline, w.saturating_sub(4)),
-                    Style::default().fg(pal::c(accent)).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(pal::c(accent))
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(Span::styled(
@@ -2556,7 +2944,9 @@ fn panel(title: &str, accent: (u8, u8, u8)) -> Block<'static> {
         .style(Style::default().bg(pal::c(pal::BG)))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(pal::c(accent)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(pal::c(accent))
+                .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(Alignment::Left)
 }
@@ -2573,7 +2963,8 @@ enum GaugeStyle {
 fn gauge(frac: f32, peak: Option<f32>, width: usize, style: GaugeStyle) -> Vec<Span<'static>> {
     let frac = frac.clamp(0.0, 1.0);
     let halves = (frac * width as f32 * 2.0).round() as usize;
-    let peak_idx = peak.map(|p| ((p.clamp(0.0, 1.0) * width as f32) as usize).min(width.saturating_sub(1)));
+    let peak_idx =
+        peak.map(|p| ((p.clamp(0.0, 1.0) * width as f32) as usize).min(width.saturating_sub(1)));
     (0..width)
         .map(|x| {
             let pos = (x as f32 + 0.5) / width.max(1) as f32;
@@ -2583,7 +2974,12 @@ fn gauge(frac: f32, peak: Option<f32>, width: usize, style: GaugeStyle) -> Vec<S
             };
             let filled = halves.saturating_sub(x * 2).min(2);
             if peak_idx == Some(x) && filled < 2 {
-                return Span::styled("▌", Style::default().fg(pal::c(pal::WHITE)).bg(pal::c(pal::TRACK)));
+                return Span::styled(
+                    "▌",
+                    Style::default()
+                        .fg(pal::c(pal::WHITE))
+                        .bg(pal::c(pal::TRACK)),
+                );
             }
             match filled {
                 2 => Span::styled("█", Style::default().fg(col)),
@@ -2729,7 +3125,11 @@ fn sparkline(
     let pad = width.saturating_sub(n);
     let mut out: Vec<Vec<Span<'static>>> = vec![Vec::with_capacity(width); rows];
     for x in 0..width {
-        let v = if x < pad { f32::NAN } else { values[start + x - pad] };
+        let v = if x < pad {
+            f32::NAN
+        } else {
+            values[start + x - pad]
+        };
         if v.is_nan() {
             for r in 0..rows {
                 out[r].push(Span::raw(" "));
@@ -3002,7 +3402,10 @@ mod tests {
         assert_eq!(fmt_rate(1234.4), "1,234");
         assert_eq!(fmt_dur(Duration::from_millis(820)), "0.82s");
         assert_eq!(fmt_dur(Duration::from_secs(75)), "1m15s");
-        assert_eq!(cmd_arg("x --cache-type-k q8_0 --y", "--cache-type-k").as_deref(), Some("q8_0"));
+        assert_eq!(
+            cmd_arg("x --cache-type-k q8_0 --y", "--cache-type-k").as_deref(),
+            Some("q8_0")
+        );
     }
 
     #[test]
@@ -3019,5 +3422,21 @@ mod tests {
         let (tw, th, tpr) = layer_tile_size(60, 10, 41);
         let tpc = 10 / th;
         assert!(tpr * tpc >= 41, "{tw}x{th} tpr {tpr}");
+    }
+}
+
+/// 320_001_536 → "320M", 20_000_003 → "20.0M", 4096 → "4.1K".
+fn fmt_count(n: u64) -> String {
+    let f = n as f64;
+    if f >= 1e9 {
+        format!("{:.1}B", f / 1e9)
+    } else if f >= 100e6 {
+        format!("{:.0}M", f / 1e6)
+    } else if f >= 1e6 {
+        format!("{:.1}M", f / 1e6)
+    } else if f >= 1e3 {
+        format!("{:.1}K", f / 1e3)
+    } else {
+        n.to_string()
     }
 }

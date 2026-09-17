@@ -139,7 +139,12 @@ impl FadeState {
         let tau_down = 2.4;
 
         for i in 0..n_layers {
-            let target = sample.layer_target.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let target = sample
+                .layer_target
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
             self.layer[i] = smooth(self.layer[i], target, dt, tau_up, tau_down);
             if let Some(h) = self.layer_hist.get_mut(i) {
                 h.push_back(self.layer[i]);
@@ -160,7 +165,9 @@ impl FadeState {
         if let Some(routing) = &sample.routing {
             self.real_routing = true;
             for (il, toks) in routing {
-                let Some(row) = self.expert.get_mut(*il) else { continue };
+                let Some(row) = self.expert.get_mut(*il) else {
+                    continue;
+                };
                 let n = toks.len();
                 for (k, ids) in toks.iter().enumerate() {
                     // Tokens arrived between polls; age the older ones a little
@@ -258,7 +265,9 @@ pub fn routed_indices(layer: usize, step: usize, n_experts: usize, k: usize) -> 
     let mut out = Vec::with_capacity(k);
     let mut guard = 0;
     while out.len() < k && guard < k * 8 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let e = ((x >> 33) as usize) % n_experts;
         if !out.contains(&e) {
             out.push(e);
@@ -346,12 +355,21 @@ mod tests {
         f.tick(&sample);
         assert!(f.real_routing);
         assert!(f.expert[1][3] > 0.99 && f.expert[1][9] > 0.99);
-        assert!(f.expert[1][5] > 0.9 && f.expert[1][5] < f.expert[1][9], "older token is slightly cooler");
-        assert!(f.expert[0].iter().all(|&h| h == 0.0), "layer 0 untouched, stand-in disabled");
+        assert!(
+            f.expert[1][5] > 0.9 && f.expert[1][5] < f.expert[1][9],
+            "older token is slightly cooler"
+        );
+        assert!(
+            f.expert[0].iter().all(|&h| h == 0.0),
+            "layer 0 untouched, stand-in disabled"
+        );
         sample.routing = None;
         sample.token_step = 8;
         f.tick(&sample);
-        assert!(f.expert[0].iter().all(|&h| h == 0.0), "stand-in stays off without real data");
+        assert!(
+            f.expert[0].iter().all(|&h| h == 0.0),
+            "stand-in stays off without real data"
+        );
     }
 
     #[test]
@@ -359,7 +377,10 @@ mod tests {
         let up = smooth(0.0, 1.0, 0.05, 0.18, 2.4);
         let down = smooth(1.0, 0.0, 0.05, 0.18, 2.4);
         assert!(up > 0.15, "attack {up}");
-        assert!(down > 0.95, "release should barely move in 50ms, got {down}");
+        assert!(
+            down > 0.95,
+            "release should barely move in 50ms, got {down}"
+        );
     }
 
     #[test]
@@ -396,6 +417,10 @@ mod tests {
             f.tick(&sample);
         }
         assert!(f.layer[0] < hot, "should start fading");
-        assert!(f.layer[0] > 0.15, "should not snap to zero, got {}", f.layer[0]);
+        assert!(
+            f.layer[0] > 0.15,
+            "should not snap to zero, got {}",
+            f.layer[0]
+        );
     }
 }

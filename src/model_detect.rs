@@ -514,8 +514,11 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
         "kobold",
         "tabbyapi",
         "transformers",
-        ".gguf",
     ];
+    // A bare ".gguf" substring match is too loose: it fires on anything that
+    // merely mentions a GGUF filename (a download, an `ls`, a `cp`), not just
+    // a server loading one. `names_a_model` already validates that a
+    // `--model`/`-m` flag actually points at a model file.
     keys.iter().any(|k| p.contains(k) || c.contains(k)) || names_a_model(cmdline)
 }
 
@@ -981,6 +984,17 @@ mod tests {
             "serve",
             "./serve --model-path mistralai/Mistral-7B"
         ));
+    }
+
+    #[test]
+    fn merely_mentioning_gguf_is_not_a_server() {
+        // A download, copy, or listing of a .gguf file is not an inference
+        // server; only a --model/-m flag pointing at one counts.
+        assert!(!looks_like_llm(
+            "bash",
+            "bash -c hf download unsloth/Qwen3.8-GGUF UD-Q3_K_XL/model-00002-of-00003.gguf --local-dir ."
+        ));
+        assert!(!looks_like_llm("cp", "cp /models/foo.gguf /mnt/backup/"));
     }
 
     #[test]

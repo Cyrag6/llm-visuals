@@ -519,7 +519,20 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
     // merely mentions a GGUF filename (a download, an `ls`, a `cp`), not just
     // a server loading one. `names_a_model` already validates that a
     // `--model`/`-m` flag actually points at a model file.
-    keys.iter().any(|k| p.contains(k) || c.contains(k)) || names_a_model(cmdline)
+    //
+    // The keyword search itself must not be a raw substring scan over the
+    // whole command line either: a `bash -c '...pgrep -f "llama-server.*
+    // --port 8090"...'` monitoring loop, or a path segment like
+    // `run_vllm.sh`, contains these keywords without being the server. Match
+    // only a whole argv token (or its path basename), the shape an actual
+    // invocation takes.
+    let token_matches = |t: &str| {
+        keys.iter()
+            .any(|k| t == *k || Path::new(t).file_name().is_some_and(|f| f == *k))
+    };
+    keys.iter().any(|k| p.contains(k))
+        || c.split_whitespace().any(token_matches)
+        || names_a_model(cmdline)
 }
 
 /// Interpreters whose `-m` means "run this module", not "load this model".
@@ -995,6 +1008,27 @@ mod tests {
             "bash -c hf download unsloth/Qwen3.8-GGUF UD-Q3_K_XL/model-00002-of-00003.gguf --local-dir ."
         ));
         assert!(!looks_like_llm("cp", "cp /models/foo.gguf /mnt/backup/"));
+    }
+
+    #[test]
+    fn keyword_mention_inside_a_wrapper_script_is_not_a_server() {
+        // A monitoring/load-test loop that merely names the server in a
+        // pgrep pattern or a path segment is not the server itself; only a
+        // whole argv token (or its path basename) counts as a real mention.
+        assert!(!looks_like_llm(
+            "bash",
+            r#"bash -c while pgrep -f "llama-server.*--port 8090" >/dev/null; do sleep 1; done"#
+        ));
+        assert!(!looks_like_llm(
+            "bash",
+            "bash /home/seth/epyc/vllm-b70/run_vllm.sh"
+        ));
+        // A real invocation still matches, whether bare or as a full path.
+        assert!(looks_like_llm(
+            "llama-server",
+            "/opt/bin/llama-server -m /models/Qwen3-4B-Q6_K.gguf -c 8192"
+        ));
+        assert!(looks_like_llm("vllm", "/opt/venv/bin/vllm serve /model"));
     }
 
     #[test]

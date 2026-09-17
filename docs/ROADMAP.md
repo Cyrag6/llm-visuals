@@ -11,7 +11,8 @@ is put together.
 - Context bar, MTP acceptance panel (`/metrics`), layer tiles, expert heat map.
 - Real router choices via a llama-server patch (`patches/`, `GET /experts`).
 - Truecolor with automatic 256-colour fallback; `--demo` runs without hardware.
-- `--log-db`: model, GPU and per-request history to SQLite.
+- `--log-db`: model, GPU and per-request history to SQLite, on by default.
+- Settings screen (`s`): change options live or save them as launch defaults.
 - Memory pipeline view (`b`): disk, RAM, PCIe, VRAM, prefill and decode VU
   meters with a bottleneck verdict; bytes per step from the GGUF tensor table.
 - Native Windows: process detection and memory counters via `sysinfo`.

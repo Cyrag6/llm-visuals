@@ -31,10 +31,13 @@ impl std::fmt::Display for ViewMode {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "llm-visuals",
-    about = "Real-time terminal dashboard for a locally running LLM"
+    about = "Real-time terminal dashboard for a locally running LLM",
+    // Saved settings are passed ahead of the real command line, so a flag
+    // given twice must take its last value rather than be an error.
+    args_override_self = true
 )]
 pub struct Args {
     /// HuggingFace model id or local path. Default `auto` observes the running LLM.
@@ -113,9 +116,10 @@ pub struct Args {
     #[arg(long, default_value = "all")]
     pub pid: String,
 
-    /// Append model/GPU samples and finished requests to this SQLite file
-    #[arg(long)]
-    pub log_db: Option<PathBuf>,
+    /// SQLite file for model/GPU samples and finished requests: `auto` (a
+    /// per-user data directory), `off`, or a path
+    #[arg(long, default_value = "auto")]
+    pub log_db: String,
 
     /// Seconds between --log-db sample rows
     #[arg(long, default_value_t = 1.0)]
@@ -141,6 +145,17 @@ impl Args {
             }
         }
         PathBuf::from("src/llm/python_bridge.py")
+    }
+
+    /// Where `--log-db` writes, or None when logging is off. `auto` stays off
+    /// in `--demo` so synthetic numbers never mix into the real history.
+    pub fn log_db_path(&self) -> Option<PathBuf> {
+        match self.log_db.as_str() {
+            "off" | "none" | "" => None,
+            "auto" if self.demo => None,
+            "auto" => crate::settings::default_db_path(),
+            path => Some(PathBuf::from(path)),
+        }
     }
 
     /// Whether to auto-detect the running model (explicit flag or "auto" value)

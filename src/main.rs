@@ -14,8 +14,8 @@ mod vllm;
 mod perf;
 mod pipeline;
 mod render;
+mod settings;
 
-use clap::Parser;
 use config::{Args, ViewMode};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -220,6 +220,23 @@ async fn poll_server(
     }
 }
 
+/// Opens the log database `args` asks for; `Ok(None)` when logging is off.
+fn open_db(args: &Args) -> Result<Option<dblog::DbLog>, String> {
+    let Some(path) = args.log_db_path() else {
+        return Ok(None);
+    };
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    dblog::DbLog::open(
+        &path,
+        Duration::from_secs_f64(args.log_every.max(0.05)),
+        args.log_db_max_mb * 1024 * 1024,
+    )
+    .map(Some)
+    .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// How the status line describes what is being watched.
 fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
@@ -241,7 +258,8 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let launch = settings::launch();
+    let mut args = launch.args.clone();
     colors::init_color_mode(&args.color);
     let mut theme_name = args.theme.clone();
     let theme = colors::get_theme(&theme_name);
@@ -263,14 +281,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(args.moe_experts);
     let mut renderer = Renderer::new(theme, args.max_layers, args.max_heads, moe_experts);
 
-    // Opened before raw mode so a bad path fails with a readable error.
-    let mut db = match &args.log_db {
-        Some(path) => Some(dblog::DbLog::open(
-            path,
-            Duration::from_secs_f64(args.log_every.max(0.05)),
-            args.log_db_max_mb * 1024 * 1024,
-        )?),
-        None => None,
+    // Opened before raw mode so a bad explicit path fails with a readable
+    // error. The default location only turns logging off: it was not asked for.
+    let mut startup_note = launch.warning.clone();
+    let mut db = match open_db(&args) {
+        Ok(db) => db,
+        Err(e) if args.log_db == "auto" => {
+            startup_note = Some(format!("--log-db off: {e}"));
+            None
+        }
+        Err(e) => return Err(e.into()),
     };
 
     crossterm::terminal::enable_raw_mode()?;
@@ -325,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (pids_tx, pids_rx) =
         tokio::sync::watch::channel(slots.iter().map(|s| s.model.key()).collect::<Vec<u32>>());
     let gpu_filter = args.gpu_indices();
-    let poll = Duration::from_millis(args.poll_ms.max(50));
+    let mut poll = Duration::from_millis(args.poll_ms.max(50));
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
 
     if args.demo {
@@ -390,12 +410,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         status_for(&slots, false)
     };
+    if let Some(note) = startup_note {
+        status = note;
+    }
+    let mut settings_form: Option<settings::SettingsForm> = None;
 
     loop {
         tokio::task::yield_now().await;
+        let mut rescan = false;
         if event::poll(Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+                if key.kind == KeyEventKind::Press && settings_form.is_some() {
+                    let form = settings_form.as_mut().unwrap();
+                    let mut close = false;
+                    let save = match form.handle_key(key) {
+                        settings::Action::None => None,
+                        settings::Action::Close => {
+                            close = true;
+                            None
+                        }
+                        settings::Action::Apply => Some(false),
+                        settings::Action::Save => Some(true),
+                    };
+                    if let Some(save) = save {
+                        match form.resolve(&launch.argv) {
+                            Err(e) => form.error = Some(e),
+                            Ok(new) => {
+                                let saved = if save { Some(form.save()) } else { None };
+                                if let Some(Err(e)) = saved {
+                                    form.error = Some(format!("not saved: {e}"));
+                                } else {
+                                    theme_name = new.theme.clone();
+                                    renderer.theme = colors::get_theme(&theme_name);
+                                    colors::init_color_mode(&new.color);
+                                    renderer.max_layers = new.max_layers;
+                                    renderer.max_heads = new.max_heads;
+                                    let relog = new.log_db_path() != args.log_db_path()
+                                        || new.log_every != args.log_every
+                                        || new.log_db_max_mb != args.log_db_max_mb;
+                                    rescan = !new.demo
+                                        && (new.poll_ms != args.poll_ms
+                                            || new.max_models != args.max_models
+                                            || new.pid != args.pid);
+                                    let gpu_changed = new.gpu != args.gpu;
+                                    args = new;
+                                    poll = Duration::from_millis(args.poll_ms.max(50));
+                                    status = match saved {
+                                        Some(Ok(path)) => {
+                                            format!("settings saved to {}", path.display())
+                                        }
+                                        _ => "settings applied to this session".into(),
+                                    };
+                                    if gpu_changed {
+                                        status.push_str("; GPU selection applies at next launch");
+                                    }
+                                    if relog {
+                                        db = None; // close the old file before reopening
+                                        match open_db(&args) {
+                                            Ok(d) => db = d,
+                                            Err(e) => status = format!("--log-db off: {e}"),
+                                        }
+                                    }
+                                    close = true;
+                                }
+                            }
+                        }
+                    }
+                    if close {
+                        settings_form = None;
+                    }
+                } else if key.kind == KeyEventKind::Press {
                     let n = slots.len().max(1);
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
@@ -414,53 +498,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 focus = i;
                             }
                         }
-                        KeyCode::Char('r') if !args.demo => {
-                            for h in pollers.drain(..) {
-                                h.abort();
-                            }
-                            // Keep the counters of models that are still up.
-                            let found = discover(&args);
-                            let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
-                            for m in found {
-                                match slots.iter().position(|s| s.model.key() == m.key()) {
-                                    Some(pos) => {
-                                        let mut slot = slots.swap_remove(pos);
-                                        slot.num_layers = m.n_layers();
-                                        slot.num_heads = m.n_heads();
-                                        if let Some(c) = m.ctx_max {
-                                            slot.ctx_max = c;
-                                        }
-                                        slot.model = m;
-                                        kept.push(slot);
-                                    }
-                                    None => kept.push(ModelSlot::new(m)),
-                                }
-                            }
-                            slots = kept;
-                            focus = focus.min(slots.len().saturating_sub(1));
-                            slot_of = slots
-                                .iter()
-                                .enumerate()
-                                .map(|(i, s)| (s.model.key(), i))
-                                .collect();
-                            let _ = pids_tx.send(slots.iter().map(|s| s.model.key()).collect());
-                            pollers = spawn_pollers(
-                                &slots.iter().map(|s| s.model.clone()).collect::<Vec<_>>(),
-                                &live_tx,
-                                &spec_tx,
-                                &experts_tx,
-                                poll,
-                            );
-                            status = status_for(&slots, true);
+                        KeyCode::Char('r') if !args.demo => rescan = true,
+                        KeyCode::Char('s') => {
+                            settings_form = Some(settings::SettingsForm::new(&args))
                         }
                         KeyCode::Char('t') => {
                             theme_name = colors::next_theme_name(&theme_name).to_string();
                             renderer.theme = colors::get_theme(&theme_name);
+                            args.theme = theme_name.clone();
                         }
                         _ => {}
                     }
                 }
             }
+        }
+        if rescan {
+            for h in pollers.drain(..) {
+                h.abort();
+            }
+            // Keep the counters of models that are still up.
+            let found = discover(&args);
+            let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
+            for m in found {
+                match slots.iter().position(|s| s.model.key() == m.key()) {
+                    Some(pos) => {
+                        let mut slot = slots.swap_remove(pos);
+                        slot.num_layers = m.n_layers();
+                        slot.num_heads = m.n_heads();
+                        if let Some(c) = m.ctx_max {
+                            slot.ctx_max = c;
+                        }
+                        slot.model = m;
+                        kept.push(slot);
+                    }
+                    None => kept.push(ModelSlot::new(m)),
+                }
+            }
+            slots = kept;
+            focus = focus.min(slots.len().saturating_sub(1));
+            slot_of = slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.model.key(), i))
+                .collect();
+            let _ = pids_tx.send(slots.iter().map(|s| s.model.key()).collect());
+            pollers = spawn_pollers(
+                &slots.iter().map(|s| s.model.clone()).collect::<Vec<_>>(),
+                &live_tx,
+                &spec_tx,
+                &experts_tx,
+                poll,
+            );
+            status = status_for(&slots, true);
         }
 
         let now = Instant::now();
@@ -615,6 +704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             theme_name: &theme_name,
             demo: args.demo,
             experts: cur.and_then(|v| v.experts),
+            settings: settings_form.as_ref(),
         };
         renderer.render_frame(&mut terminal, &dash);
 

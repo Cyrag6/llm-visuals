@@ -1,9 +1,10 @@
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::Color;
 
-/// Whether the terminal takes 24-bit colour. Decided once at startup.
-static TRUECOLOR: OnceLock<bool> = OnceLock::new();
+/// Whether the terminal takes 24-bit colour: 0 = not decided yet, 1 = yes,
+/// 2 = no. Decided at startup and again when the settings screen changes it.
+static TRUECOLOR: AtomicU8 = AtomicU8::new(0);
 
 /// `mode`: "auto" | "truecolor" | "256".
 pub fn init_color_mode(mode: &str) {
@@ -12,11 +13,17 @@ pub fn init_color_mode(mode: &str) {
         "256" | "ansi256" | "indexed" => false,
         _ => detect_truecolor(),
     };
-    let _ = TRUECOLOR.set(tc);
+    TRUECOLOR.store(if tc { 1 } else { 2 }, Ordering::Relaxed);
 }
 
 pub fn truecolor() -> bool {
-    *TRUECOLOR.get_or_init(detect_truecolor)
+    match TRUECOLOR.load(Ordering::Relaxed) {
+        0 => {
+            init_color_mode("auto");
+            truecolor()
+        }
+        v => v == 1,
+    }
 }
 
 fn detect_truecolor() -> bool {

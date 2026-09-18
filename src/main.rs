@@ -95,13 +95,34 @@ impl ModelSlot {
 
 /// The servers to watch: everything detected, minus anything the `--pid`
 /// filter excludes, capped at `--max-models`.
-fn discover(args: &Args) -> Vec<DetectedModel> {
+async fn discover(args: &Args) -> Vec<DetectedModel> {
     let filter = args.pid_filter();
     let mut found = model_detect::detect_models();
     if !filter.is_empty() {
         found.retain(|m| filter.contains(&m.pid));
     }
     found.truncate(args.max_models.max(1));
+    // `llama-server -hf owner/repo:quant` does not put a local GGUF path on
+    // its command line. Current llama.cpp exposes the resolved path via
+    // `/props`; use it so layer counts and tensor layout remain available.
+    let mut probes = tokio::task::JoinSet::new();
+    for (index, model) in found.iter().enumerate() {
+        if model.engine == "llama.cpp" && model.gguf.is_none() {
+            if let Some(port) = model.port {
+                probes.spawn(async move { (index, observe::poll_llama_props(port).await) });
+            }
+        }
+    }
+    while let Some(result) = probes.join_next().await {
+        if let Ok((index, Some(props))) = result {
+            if let Some(model) = found.get_mut(index) {
+                model_detect::load_gguf_metadata(model, props.model_path.into());
+                if let Some(alias) = props.model_alias {
+                    model.name = alias;
+                }
+            }
+        }
+    }
     found
 }
 
@@ -270,7 +291,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(ModelSlot::new)
             .collect()
     } else {
-        discover(&args).into_iter().map(ModelSlot::new).collect()
+        discover(&args)
+            .await
+            .into_iter()
+            .map(ModelSlot::new)
+            .collect()
     };
     let mut focus: usize = 0;
 
@@ -523,7 +548,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h.abort();
             }
             // Keep the counters of models that are still up.
-            let found = discover(&args);
+            let found = discover(&args).await;
             let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
             for m in found {
                 match slots.iter().position(|s| s.model.key() == m.key()) {

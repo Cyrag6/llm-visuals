@@ -97,6 +97,28 @@ impl DetectedModel {
     }
 }
 
+/// Populate model identity and tensor metadata after a model path is learned
+/// from somewhere other than the process command line (for example llama.cpp
+/// `/props` when the server was launched with `-hf`).
+pub fn load_gguf_metadata(model: &mut DetectedModel, path: PathBuf) {
+    let path = if !path.exists() {
+        resolve_container_path(model.pid, &path).unwrap_or(path)
+    } else {
+        path
+    };
+    model.path = Some(path.clone());
+    if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+        return;
+    }
+    if let Ok(info) = gguf::read_info(&path) {
+        if model.name.starts_with('[') || model.name == "llama-server" || model.name.is_empty() {
+            model.name = info.name.clone();
+        }
+        model.gguf = Some(info);
+        model.tensors = gguf::read_tensor_summary(&path).ok();
+    }
+}
+
 /// Undo the escapes mountinfo applies to mount points/roots
 /// (\040 space, \011 tab, \013 newline).
 fn unescape_mount(s: &str) -> String {
@@ -430,24 +452,12 @@ pub fn detect_models() -> Vec<DetectedModel> {
             // /proc/<pid>/mountinfo so the size (and the GGUF metadata
             // below) reads the host-side file.
             let path = if !path.exists() {
-                match resolve_container_path(m.pid, &path) {
-                    Some(p) => {
-                        m.path = Some(p.clone());
-                        p
-                    }
-                    None => path,
-                }
+                resolve_container_path(m.pid, &path).unwrap_or(path)
             } else {
                 path
             };
             if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                if let Ok(info) = gguf::read_info(&path) {
-                    if m.name.starts_with('[') || m.name == "llama-server" || m.name.is_empty() {
-                        m.name = info.name.clone();
-                    }
-                    m.gguf = Some(info);
-                    m.tensors = gguf::read_tensor_summary(&path).ok();
-                }
+                load_gguf_metadata(m, path);
             } else if m.ctx_max.is_none() && path.is_dir() {
                 // A safetensors dir has no GGUF ctx_train; vLLM's default
                 // --max-model-len is the config's max_position_embeddings,

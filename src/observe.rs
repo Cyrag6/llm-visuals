@@ -208,10 +208,27 @@ pub async fn poll_llama(port: u16) -> Option<LiveStats> {
     parse_slots(&body)
 }
 
-#[allow(dead_code)]
-pub async fn poll_llama_props(port: u16) -> Option<Value> {
+#[derive(Debug, PartialEq)]
+pub struct LlamaProps {
+    pub model_path: String,
+    pub model_alias: Option<String>,
+}
+
+pub async fn poll_llama_props(port: u16) -> Option<LlamaProps> {
     let body = http_get("127.0.0.1", port, "/props").await.ok()?;
-    serde_json::from_str(&body).ok()
+    parse_llama_props(&body)
+}
+
+pub fn parse_llama_props(body: &str) -> Option<LlamaProps> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    Some(LlamaProps {
+        model_path: v.get("model_path")?.as_str()?.to_owned(),
+        model_alias: v
+            .get("model_alias")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    })
 }
 
 pub fn parse_slots(body: &str) -> Option<LiveStats> {
@@ -325,6 +342,24 @@ mod tests {
         assert_eq!(s.slots_busy, 0);
         assert_eq!(s.spec_types, "none,draft-mtp");
         assert!((s.cache_hit_frac() - 100.0 / 2537.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parse_llama_props_model_loaded_via_hf() {
+        let body = r#"{
+            "model_alias":"ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+            "model_path":"C:\\Users\\me\\.cache\\huggingface\\model.gguf"
+        }"#;
+        let props = parse_llama_props(body).expect("props");
+        assert_eq!(
+            props.model_path,
+            r"C:\Users\me\.cache\huggingface\model.gguf"
+        );
+        assert_eq!(
+            props.model_alias.as_deref(),
+            Some("ggml-org/Qwen3.8-27B-GGUF:Q4_K_M")
+        );
+        assert!(parse_llama_props(r#"{"model_alias":"missing-path"}"#).is_none());
     }
 
     #[test]

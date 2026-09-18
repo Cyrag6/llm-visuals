@@ -855,7 +855,12 @@ impl Renderer {
         );
         // Fact items, most useful first; trailing ones are shed when space is short.
         let mut items: Vec<Span> = Vec::new();
-        if d.live.prompt_tokens > 0 {
+        if d.live.cache_unknown {
+            items.push(Span::styled(
+                "cache hit —",
+                Style::default().fg(pal::c(pal::VIOLET)),
+            ));
+        } else if d.live.prompt_tokens > 0 {
             items.push(Span::styled(
                 format!("cache hit {:.0}%", d.live.cache_hit_frac() * 100.0),
                 Style::default().fg(pal::c(pal::VIOLET)),
@@ -866,6 +871,11 @@ impl Renderer {
                 let v = cmd_arg(&m.cmdline, "--cache-type-v").unwrap_or_else(|| k.clone());
                 items.push(Span::styled(
                     format!("KV {k}/{v}"),
+                    Style::default().fg(pal::c(pal::TEAL)),
+                ));
+            } else if let Some(k) = cmd_arg(&m.cmdline, "--kv-cache-dtype") {
+                items.push(Span::styled(
+                    format!("KV {k}"),
                     Style::default().fg(pal::c(pal::TEAL)),
                 ));
             }
@@ -1028,10 +1038,13 @@ impl Renderer {
             .map(|g| g.n_mtp)
             .unwrap_or(d.live.spec_depth);
         let enabled = !spec_type.is_empty() && spec_type != "none";
+        let mtp = spec_type.to_ascii_lowercase().contains("mtp");
         let title = if !enabled {
             " ◆ MTP  no speculative decoding ".to_string()
-        } else if depth > 0 {
+        } else if mtp && depth > 0 {
             format!(" ◆ MTP  {spec_type} · depth {depth} ")
+        } else if depth > 0 {
+            format!(" ◆ SPECULATIVE  {spec_type} · depth {depth} ")
         } else {
             format!(" ◆ SPECULATIVE  {spec_type} ")
         };

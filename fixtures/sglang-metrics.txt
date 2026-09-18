@@ -1,0 +1,8 @@
+# HELP sglang:realtime_tokens_total Total number of tokens processed (updated on each log interval).
+# TYPE sglang:realtime_tokens_total counter
+sglang:realtime_tokens_total{model_name="qwen38-27b",mode="prefill_compute"} 1200.0
+sglang:realtime_tokens_total{model_name="qwen38-27b",mode="prefill_cache"} 800.0
+sglang:realtime_tokens_total{model_name="qwen38-27b",mode="decode"} 3400.0
+# HELP sglang:num_running_reqs The number of running requests
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="qwen38-27b"} 1.0

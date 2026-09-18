@@ -14,6 +14,7 @@ mod perf;
 mod pipeline;
 mod render;
 mod settings;
+mod sglang;
 mod vllm;
 
 use config::{Args, ViewMode};
@@ -168,6 +169,92 @@ async fn poll_server(
     poll: Duration,
 ) {
     let pid = model.key();
+    if model.engine == "sglang" {
+        // SGLang has no /slots. /v1/loads is always on; /server_info is
+        // fetched once at attach. Each poll is a line in SGLang's access
+        // log, so we never go faster than 400 ms.
+        let mut adapter = sglang::SglangAdapter::new();
+        let mut info = sglang::poll_server_info(port).await;
+        let mut metrics_ok = true;
+        let mut metrics_misses = 0u32;
+        let mut misses = 0u32;
+        let delay = poll.max(Duration::from_millis(400));
+        let spec_algo = info
+            .as_ref()
+            .and_then(|i| i.speculative_algorithm.clone())
+            .or_else(|| model.spec_type.clone());
+        let draft_n = info
+            .as_ref()
+            .and_then(|i| i.speculative_num_draft_tokens)
+            .or_else(|| {
+                sglang::cmdline_flag(&model.cmdline, "--speculative-num-draft-tokens")
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0);
+        loop {
+            if info.is_none() {
+                info = sglang::poll_server_info(port).await;
+            }
+            let metrics = if metrics_ok {
+                match sglang::poll_sglang_metrics(port).await {
+                    Some(m) => Some(m),
+                    None => {
+                        metrics_misses += 1;
+                        if metrics_misses >= 3 {
+                            metrics_ok = false;
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(c) = sglang::poll_loads(port).await {
+                misses = 0;
+                let (mut stats, spec_pair) = adapter.observe(&c, metrics.as_ref());
+                stats.ctx_max = info
+                    .as_ref()
+                    .and_then(|i| i.context_length)
+                    .or(model.ctx_max)
+                    .unwrap_or(0);
+                let algo = info
+                    .as_ref()
+                    .and_then(|i| i.speculative_algorithm.clone())
+                    .or_else(|| spec_algo.clone())
+                    .unwrap_or_else(|| "none".into());
+                stats.spec_types = algo;
+                stats.spec_depth = info
+                    .as_ref()
+                    .and_then(|i| i.speculative_num_draft_tokens)
+                    .unwrap_or(draft_n) as usize;
+                let _ = live_tx.try_send((model.key(), stats));
+                if let Some((generated, steps)) = spec_pair {
+                    let n = info
+                        .as_ref()
+                        .and_then(|i| i.speculative_num_draft_tokens)
+                        .unwrap_or(draft_n);
+                    if let Some(m) = sglang::spec_from_moments(generated, steps, n) {
+                        let _ = spec_tx.try_send((model.key(), m));
+                    }
+                }
+            } else {
+                misses = misses.saturating_add(1);
+                if misses == 3 {
+                    let stats = LiveStats {
+                        ctx_max: model.ctx_max.unwrap_or(0),
+                        ..Default::default()
+                    };
+                    let _ = live_tx.try_send((model.key(), stats));
+                }
+            }
+            let sleep = if misses >= 3 {
+                delay.max(Duration::from_secs(2))
+            } else {
+                delay
+            };
+            tokio::time::sleep(sleep).await;
+        }
+    }
     if model.engine == "vllm" {
         // vLLM has no /slots or /experts endpoints; its /metrics counters
         // drive the live stats and the MTP panel. The 'r' rescan drops
@@ -796,10 +883,15 @@ fn fade_sample_from_live(
     let kv_filled: Vec<bool> = (0..kv_buckets)
         .map(|i| ((i as f32 + 0.5) / kv_buckets as f32 * ctx_max as f32) as usize <= used)
         .collect();
-    let file_mb = detected
-        .and_then(|d| d.path.as_ref())
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len() / (1024 * 1024))
+    let file_mb = live
+        .weight_gb
+        .map(|g| (g * 1024.0) as u64)
+        .or_else(|| {
+            detected
+                .and_then(|d| d.path.as_ref())
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() / (1024 * 1024))
+        })
         .or_else(|| detected.map(|d| d.mem_used_mb))
         .unwrap_or(0);
     let split_sum: f32 = split.iter().copied().sum::<f32>().max(1.0);
@@ -820,13 +912,23 @@ fn fade_sample_from_live(
         } else {
             g.mem_used_mb as f32 / g.mem_total_mb as f32
         };
-        let w = if g.mem_total_mb == 0 {
-            0.0
+        let total_gb = g.vram_total_gb();
+        if let (Some(w_gb), Some(k_gb)) = (live.weight_gb, live.kv_cache_gb) {
+            // SGLang reports the real split; no file-size estimate.
+            if total_gb > 0.0 {
+                weight_frac[i] = ((w_gb * share) / total_gb).clamp(0.0, used_f);
+                kv_alloc_frac[i] =
+                    ((k_gb * share) / total_gb).clamp(0.0, (used_f - weight_frac[i]).max(0.0));
+            }
         } else {
-            (file_mb as f32 * share) / g.mem_total_mb as f32
-        };
-        weight_frac[i] = w.clamp(0.0, used_f);
-        kv_alloc_frac[i] = (used_f - weight_frac[i]).max(0.0);
+            let w = if g.mem_total_mb == 0 {
+                0.0
+            } else {
+                (file_mb as f32 * share) / g.mem_total_mb as f32
+            };
+            weight_frac[i] = w.clamp(0.0, used_f);
+            kv_alloc_frac[i] = (used_f - weight_frac[i]).max(0.0);
+        }
     }
     FadeSample {
         layer_target,

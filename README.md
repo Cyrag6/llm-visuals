@@ -3,7 +3,7 @@
 **A live terminal dashboard for the LLM running on your machine.**
 
 It finds the inference servers you already have up (llama.cpp `llama-server`,
-ollama, vLLM, …), reads their counters and `nvidia-smi`, and turns them into a
+ollama, vLLM, SGLang, …), reads their counters and `nvidia-smi`, and turns them into a
 truecolor picture of what the model is doing right now: tokens per second, time
 to first token, GPU load and memory, context fill, speculative-decoding
 acceptance, which layers are busy on which GPU, and, with a small server patch,
@@ -113,9 +113,10 @@ console, pass `--color truecolor` if colours look flat.
   instead of `/proc`. Run the dashboard as the same user as the server.
   Windows hides the command line of a process started by another user or as
   administrator, so that server is matched by name only: it is assumed to be on
-  its engine's default port (8080 for llama.cpp, 11434 for Ollama), and the
-  model name, context size and GGUF details are missing. Starting the
-  dashboard from an administrator terminal should also expose them.
+  its engine's default port (8080 for llama.cpp, 11434 for Ollama, 30000 for
+  SGLang, 8000 for vLLM), and the model name, context size and GGUF details are
+  missing. Starting the dashboard from an administrator terminal should also
+  expose them.
 - **GPU memory per process**: Windows drivers report it as `[N/A]`, so a
   server shows 0 MB in the model strip. Card-level VRAM is unaffected.
 - **Memory pipeline (`b`)**: RAM totals and the server's resident memory come
@@ -399,15 +400,15 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 
 | Metric | Source |
 |---|---|
-| decode tok/s | delta of `n_decoded` from `GET /slots`, 1 s sliding window |
-| prefill tok/s | delta of `n_prompt_tokens_processed`, same window |
+| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. 1 s sliding window |
+| prefill tok/s | llama.cpp: `n_prompt_tokens_processed`. vLLM: prompt-token counter. SGLang: `total_prefill_uncached_tokens`, or `sglang:realtime_tokens_total{mode="prefill_compute"}` with `--enable-metrics` |
 | time to first token | slot turning busy → first decoded token, quantised to the poll interval |
 | tok/J | decode tok/s ÷ summed GPU power draw |
-| cache hit | `n_prompt_tokens_cache / n_prompt_tokens` |
+| cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—") |
 | request log | one record per `id_task`; averages from accumulated deltas |
 | util, VRAM, power, °C, clocks, fan, PCIe | `nvidia-smi --query-gpu=…` every poll |
-| VRAM weights vs KV | **estimate**: GGUF file size × `--tensor-split` share; the rest of used VRAM is shown as KV, because the driver cannot see inside the process |
-| layers, heads, experts, MTP depth, engram, quant | GGUF header of the model on the server's command line |
+| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads` |
+| layers, heads, experts, MTP depth, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
 | layer → GPU | `--tensor-split` proportions |
 | layer activity | utilisation of the GPU the layer lives on, smoothed |
 | expert blocks | real top-k routing from `GET /experts` (patched server), else a deterministic stand-in keyed by layer and token step |
@@ -449,6 +450,30 @@ For a systemd unit, a drop-in with two `Environment=` lines is enough; see
 [`patches/README.md`](patches/README.md). The dashboard probes both endpoints
 at start and after `r`, and stops asking after three failures, so unpatched
 servers cost nothing.
+
+### SGLang
+
+SGLang is detected from `python -m sglang.launch_server` (and the `sglang`
+keyword). Throughput comes from `GET /v1/loads?include=all`, which needs no
+flags. Context length and the speculative algorithm come from
+`GET /server_info`. The scheduler and detokenizer worker processes are folded
+into the launcher so they do not appear as extra models.
+
+Each poll is a line in SGLang's access log, so the SGLang poller never runs
+faster than 400 ms. To silence those lines:
+
+```sh
+python -m sglang.launch_server ... \
+  --uvicorn-access-log-exclude-prefixes /v1/loads /metrics /server_info
+```
+
+Optional `--enable-metrics` adds exact prefill and prefix-cache counts via
+`sglang:realtime_tokens_total{mode="prefill_compute"|"prefill_cache"}`.
+Without it, short prompts after idle can show no prefill rate, and cache hit
+is shown as "—" rather than 0. Speculative acceptance uses SGLang's own
+arithmetic: accepted = generated − verify steps, drafted = steps × (draft
+tokens − 1). A separate draft model titles the panel SPECULATIVE rather than
+MTP.
 
 ---
 

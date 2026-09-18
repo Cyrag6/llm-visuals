@@ -183,20 +183,52 @@ fn resolve_container_path(pid: u32, path: &Path) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Context length from a HuggingFace-style weights dir's config.json
-/// ("max_position_embeddings": N). String scan instead of a JSON
-/// dependency — the key is unique and the value is a bare integer.
-fn hf_config_ctx(dir: &Path) -> Option<usize> {
+/// Architecture fields from a HuggingFace-style `config.json`. Looks
+/// under `text_config` when present (nested Qwen/Llama configs). Fills
+/// the same struct as the GGUF header so the layers and experts panels
+/// work for vLLM and SGLang safetensors dirs.
+fn hf_config_info(dir: &Path) -> Option<GgufInfo> {
     let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
-    let i = txt.find("\"max_position_embeddings\"")?;
-    let rest = &txt[i..];
-    let colon = rest.find(':')?;
-    let digits: String = rest[colon + 1..]
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let root = v.get("text_config").unwrap_or(&v);
+    let usize_at =
+        |obj: &serde_json::Value, k: &str| obj.get(k).and_then(|x| x.as_u64()).map(|n| n as usize);
+    let pick = |k: &str| usize_at(root, k).or_else(|| usize_at(&v, k));
+    let n_layers = pick("num_hidden_layers").unwrap_or(0);
+    let n_heads = pick("num_attention_heads").unwrap_or(0);
+    let n_kv_heads = pick("num_key_value_heads").unwrap_or(n_heads);
+    let n_experts = pick("num_experts")
+        .or_else(|| pick("num_local_experts"))
+        .unwrap_or(0);
+    let n_experts_used = pick("num_experts_per_tok").unwrap_or(0);
+    let ctx_train = pick("max_position_embeddings").unwrap_or(0);
+    let n_embd = pick("hidden_size").unwrap_or(0);
+    let architecture = root
+        .get("model_type")
+        .or_else(|| v.get("model_type"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if n_layers == 0 && ctx_train == 0 && n_heads == 0 {
+        return None;
+    }
+    Some(GgufInfo {
+        name,
+        architecture,
+        n_layers,
+        n_heads,
+        n_kv_heads,
+        n_experts,
+        n_experts_used,
+        ctx_train,
+        n_embd,
+        n_mtp: 0,
+        engram: None,
+    })
 }
 
 /// Whether a process that `looks_like_llm` flagged as vLLM is actually a
@@ -223,6 +255,33 @@ fn is_vllm_phantom(process_name: &str, cmdline: &str) -> bool {
     !(argv0_is_vllm || cmdline.contains("vllm.entrypoints"))
 }
 
+/// SGLang forks `sglang::scheduler` (holds the GPU memory) and
+/// `sglang::detokenizer`. Only the launcher process serves HTTP, so
+/// workers are folded into their parent rather than listed as models.
+fn is_sglang_worker(process_name: &str) -> bool {
+    let base = Path::new(process_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| process_name.to_string());
+    base.starts_with("sglang::")
+}
+
+fn ppid_from_stat(txt: &str) -> Option<u32> {
+    let rest = txt.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let txt = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    ppid_from_stat(&txt)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// A vLLM server in a Docker container reports its container-internal
 /// port (`--port 8000` inside), but from the host it is reachable at the
 /// published port (docker-proxy, e.g. `8003:8000`). This dashboard runs
@@ -234,6 +293,17 @@ fn is_vllm_phantom(process_name: &str, cmdline: &str) -> bool {
 /// its host port. Without CAP_SYS_PTRACE the other namespace's tables are
 /// unreadable; fall back to the command-line port in that case.
 fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
+    resolve_container_host_port(pid, cmdline_port, 8000)
+}
+
+/// A containerized server reports its container-internal port, but from
+/// the host it is reachable at the published port (docker-proxy). Re-anchor
+/// when the process lives in a different network namespace.
+fn resolve_container_host_port(
+    pid: u32,
+    cmdline_port: Option<u16>,
+    default_port: u16,
+) -> Option<u16> {
     let own = match std::fs::read_link("/proc/self/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(_) => return cmdline_port,
@@ -245,8 +315,7 @@ fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
         Err(_) => return cmdline_port,
     };
     if server == own {
-        // vLLM's default when --port is omitted.
-        return cmdline_port.or_else(|| Some(8000));
+        return cmdline_port.or(Some(default_port));
     }
     let ips = netns_ipv4s(pid)?;
     if ips.is_empty() {
@@ -305,7 +374,9 @@ fn resolve_vllm_host_port(pid: u32, cmdline_port: Option<u16>) -> Option<u16> {
         // all sharing the container IP); only the mapping whose container
         // side is the server's own port is ours.
         if let (Some(ip), Some(port)) = (&container_ip, host_port) {
-            if ips.iter().any(|x| x == ip) && container_port == Some(cmdline_port.unwrap_or(8000)) {
+            if ips.iter().any(|x| x == ip)
+                && container_port == Some(cmdline_port.unwrap_or(default_port))
+            {
                 return Some(port);
             }
         }
@@ -367,9 +438,22 @@ pub fn detect_models() -> Vec<DetectedModel> {
     let gpu_procs = nvidia_compute_apps();
     let mut by_pid: std::collections::HashMap<u32, DetectedModel> =
         std::collections::HashMap::new();
+    // SGLang workers hold the GPU memory; fold it onto the launcher PID.
+    let mut worker_gpu: std::collections::HashMap<u32, (u64, Vec<u32>)> =
+        std::collections::HashMap::new();
 
     for app in gpu_procs {
         let cmdline = read_cmdline(app.pid).unwrap_or_else(|| app.process_name.clone());
+        if is_sglang_worker(&app.process_name) {
+            if let Some(ppid) = parent_pid(app.pid) {
+                let e = worker_gpu.entry(ppid).or_insert((0, Vec::new()));
+                e.0 = e.0.saturating_add(app.mem_used_mb);
+                if !e.1.contains(&app.gpu_index) {
+                    e.1.push(app.gpu_index);
+                }
+            }
+            continue;
+        }
         if !looks_like_llm(&app.process_name, &cmdline) || is_self(app.pid, &cmdline) {
             continue;
         }
@@ -379,6 +463,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
         }
         if parsed.engine == "vllm" {
             parsed.port = resolve_vllm_host_port(app.pid, parsed.port);
+        }
+        if parsed.engine == "sglang" {
+            parsed.port = resolve_container_host_port(app.pid, parsed.port, 30000);
         }
         let entry = by_pid.entry(app.pid).or_insert_with(|| DetectedModel {
             name: parsed.name.clone(),
@@ -417,10 +504,16 @@ pub fn detect_models() -> Vec<DetectedModel> {
         if parsed.engine == "vllm" && is_vllm_phantom(&name, &cmdline) {
             continue;
         }
+        if is_sglang_worker(&name) {
+            continue;
+        }
         // A vLLM server in a container reports its internal port;
         // re-anchor to the port published on the host.
         if parsed.engine == "vllm" {
             parsed.port = resolve_vllm_host_port(pid, parsed.port);
+        }
+        if parsed.engine == "sglang" {
+            parsed.port = resolve_container_host_port(pid, parsed.port, 30000);
         }
         by_pid.insert(
             pid,
@@ -444,6 +537,17 @@ pub fn detect_models() -> Vec<DetectedModel> {
         );
     }
 
+    for (ppid, (mem, gpus)) in worker_gpu {
+        if let Some(m) = by_pid.get_mut(&ppid) {
+            m.mem_used_mb = m.mem_used_mb.saturating_add(mem);
+            for g in gpus {
+                if !m.gpu_indices.contains(&g) {
+                    m.gpu_indices.push(g);
+                }
+            }
+        }
+    }
+
     let mut models: Vec<DetectedModel> = by_pid.into_values().collect();
     for m in &mut models {
         if let Some(path) = m.path.clone() {
@@ -458,11 +562,19 @@ pub fn detect_models() -> Vec<DetectedModel> {
             };
             if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
                 load_gguf_metadata(m, path);
-            } else if m.ctx_max.is_none() && path.is_dir() {
-                // A safetensors dir has no GGUF ctx_train; vLLM's default
-                // --max-model-len is the config's max_position_embeddings,
-                // so that is the served context when the flag is absent.
-                m.ctx_max = hf_config_ctx(&path);
+            } else if path.is_dir() {
+                // A safetensors dir has no GGUF header; read config.json
+                // so layers/heads/experts populate the same panels. vLLM
+                // and SGLang default context is max_position_embeddings
+                // when --max-model-len / --context-length is absent.
+                if let Some(info) = hf_config_info(&path) {
+                    if m.ctx_max.is_none() && info.ctx_train > 0 {
+                        m.ctx_max = Some(info.ctx_train);
+                    }
+                    if m.gguf.is_none() {
+                        m.gguf = Some(info);
+                    }
+                }
             }
         }
         m.gpu_indices.sort_unstable();
@@ -539,6 +651,10 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
     let token_matches = |t: &str| {
         keys.iter()
             .any(|k| t == *k || Path::new(t).file_name().is_some_and(|f| f == *k))
+            // `python -m sglang.launch_server` is one argv token that is
+            // not the bare keyword `sglang`.
+            || t.contains("sglang.launch_server")
+            || t.contains("sglang.srt.entrypoints")
     };
     keys.iter().any(|k| p.contains(k))
         || c.split_whitespace().any(token_matches)
@@ -697,6 +813,15 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
                     }
                 }
             }
+            // SGLang's context-length flag (llama.cpp's is --ctx-size).
+            "--context-length" | "--context_length" => {
+                if let Some(v) = next() {
+                    parsed.ctx_max = v.parse().ok();
+                    if inline.is_none() {
+                        i += 1;
+                    }
+                }
+            }
             // vLLM's context-length flag (llama.cpp's is --ctx-size).
             "--max-model-len" | "--max_model_len" => {
                 if let Some(v) = next() {
@@ -738,7 +863,10 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
                     }
                 }
             }
-            "--spec-type" | "--spec_type" => {
+            "--spec-type"
+            | "--spec_type"
+            | "--speculative-algorithm"
+            | "--speculative_algorithm" => {
                 if let Some(v) = next() {
                     parsed.spec_type = Some(v);
                     if inline.is_none() {
@@ -801,6 +929,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     }
     if parsed.port.is_none() && parsed.engine == "ollama" {
         parsed.port = Some(11434);
+    }
+    if parsed.port.is_none() && parsed.engine == "sglang" {
+        parsed.port = Some(30000);
     }
     parsed
 }
@@ -1129,8 +1260,76 @@ mod tests {
             "{\n  \"model_type\": \"qwen3\",\n  \"max_position_embeddings\": 40960,\n  \"vocab_size\": 151936\n}\n",
         )
         .unwrap();
-        assert_eq!(hf_config_ctx(&dir), Some(40960));
+        assert_eq!(hf_config_info(&dir).map(|g| g.ctx_train), Some(40960));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hf_config_reads_nested_text_config_and_experts() {
+        let dir = std::env::temp_dir().join("llm-visuals-test-hfcfg-moe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+              "model_type": "qwen3_moe",
+              "text_config": {
+                "model_type": "qwen3_moe",
+                "num_hidden_layers": 48,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 4,
+                "num_experts": 128,
+                "num_experts_per_tok": 8,
+                "max_position_embeddings": 40960,
+                "hidden_size": 2048
+              }
+            }"#,
+        )
+        .unwrap();
+        let g = hf_config_info(&dir).expect("config");
+        assert_eq!(g.n_layers, 48);
+        assert_eq!(g.n_heads, 32);
+        assert_eq!(g.n_kv_heads, 4);
+        assert_eq!(g.n_experts, 128);
+        assert_eq!(g.n_experts_used, 8);
+        assert_eq!(g.ctx_train, 40960);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_sglang_launch_cmdline() {
+        let cmd = "/usr/bin/python3 -m sglang.launch_server --model-path /models/Qwen3.8-27B --port 30000 --context-length 40960 --speculative-algorithm EAGLE --kv-cache-dtype fp8";
+        assert!(looks_like_llm("python3", cmd));
+        let p = parse_cmdline("python3", cmd);
+        assert_eq!(p.engine, "sglang");
+        assert_eq!(p.port, Some(30000));
+        assert_eq!(p.ctx_max, Some(40960));
+        assert_eq!(p.spec_type.as_deref(), Some("EAGLE"));
+        assert!(p
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("Qwen3.8-27B")));
+
+        // Default port when --port is omitted.
+        let p = parse_cmdline(
+            "python3",
+            "python3 -m sglang.launch_server --model-path /models/qwen",
+        );
+        assert_eq!(p.port, Some(30000));
+        assert!(looks_like_llm(
+            "python3",
+            "python3 -m sglang.launch_server --host 0.0.0.0"
+        ));
+    }
+
+    #[test]
+    fn sglang_workers_are_folded() {
+        assert!(is_sglang_worker("sglang::scheduler"));
+        assert!(is_sglang_worker("sglang::detokenizer"));
+        assert!(!is_sglang_worker("python3"));
+        // /proc/<pid>/stat: comm in parens, then state, then ppid.
+        let stat =
+            "4321 (sglang::scheduler) S 1200 1200 1200 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0";
+        assert_eq!(ppid_from_stat(stat), Some(1200));
     }
 
     #[test]

@@ -16,15 +16,15 @@ is put together.
 - Memory pipeline view (`b`): disk, RAM, PCIe, VRAM, prefill and decode VU
   meters with a bottleneck verdict; bytes per step from the GGUF tensor table.
 - Native Windows: process detection and memory counters via `sysinfo`.
+- SGLang: `/v1/loads` poller, `/server_info`, worker folding, safetensors
+  `config.json` architecture fields (also used by vLLM).
 
 ## Ideas not yet done
 
 - Per-position acceptance rates for deeper MTP drafts (server logs them but
   does not export them).
 - Show the /experts 256-token histogram as a load-balance view per layer.
-- Ollama metrics endpoint for throughput (vLLM done — a native `/metrics`
-  adapter reconstructs per-request stats and MTP counters from the
-  engine-wide Prometheus counters).
+- Ollama metrics endpoint for throughput (vLLM and SGLang done).
 - Real DRAM bandwidth (perf uncore counters) instead of the bytes × steps
   estimate; per-GPU memory bandwidth ceilings so the VRAM meter can show GB/s
   against the card's peak.

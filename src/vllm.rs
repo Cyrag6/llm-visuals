@@ -332,6 +332,10 @@ impl VllmAdapter {
                 / (c.ttft_count - self.base_ttft_count).max(1.0),
             itl_sum: (c.itl_sum - self.base_itl_sum).max(0.0),
             closing: self.pending_close.take(),
+            cache_unknown: false,
+            weight_gb: None,
+            kv_cache_gb: None,
+            kv_tokens: None,
         };
 
         let spec = spec_active.then(|| SpecMetrics {

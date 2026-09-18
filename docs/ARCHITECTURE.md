@@ -61,6 +61,8 @@ GPUs and the disk are shared.
 | `model_detect.rs` | finds inference processes via `nvidia-smi --query-compute-apps` and `/proc`, parses their command lines (model path, port, ctx size, tensor split, spec mode); returns every server found, best first, minus this process and idle daemons |
 | `gguf.rs` | reads the GGUF header without loading tensors; maps layers to GPUs from `--tensor-split`; `read_tensor_summary` walks the tensor table and sizes each tensor from the gap to the next offset (no quant type table needed) |
 | `observe.rs` | HTTP GET with timeouts; parsers for `/slots`, `/metrics` (Prometheus text) and `/experts` |
+| `vllm.rs` | vLLM `/metrics` adapter: reconstructs per-request `LiveStats` from engine-wide Prometheus counters |
+| `sglang.rs` | SGLang adapter: `GET /v1/loads?include=all` plus one-shot `/server_info`; optional `sglang:realtime_tokens_total` |
 | `gpu.rs` | `nvidia-smi` CSV collector on a `spawn_blocking` thread; smooth random-walk demo GPUs |
 | `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers; `Meter` (VU channel with peak hold and auto scale) and `BandwidthStats` for the pipeline view |
 | `host.rs` | host counters: `/proc/diskstats`, `/proc/<pid>/io`, `/proc/<pid>/stat` (major faults), `/proc/<pid>/status` (`RssFile`), `/proc/meminfo`, and PCIe rx/tx per GPU from `nvidia-smi dmon -s t -c 1`. The system-wide reads happen once per poll and are shared across every PID, so watching six models costs the same `nvidia-smi` calls as watching one |
@@ -91,6 +93,21 @@ Each optional endpoint is probed at start and after a rescan; after three
 failures that model's poller stops asking, so unpatched or older servers cost
 nothing. The judgement is per model: a patched server next to an unpatched one
 still gets its expert routing.
+
+**SGLang `/v1/loads?include=all`** is always on. `decode_moments[5]` is
+cumulative generated tokens, `decode_moments[0]` is decode/verify steps,
+`total_prefill_uncached_tokens` is prefill, `num_used_tokens` is context
+occupancy, `memory.weight_gb` / `memory.kv_cache_gb` are the real VRAM split.
+There is no completion counter: a request starts on the idle→busy edge or
+when `num_used_tokens` drops sharply while still busy. `/server_info` is
+fetched once for `context_length` and `speculative_algorithm`. Speculative
+acceptance is `generated − steps`, drafted tokens are
+`steps × (num_draft_tokens − 1)`. The SGLang poller never runs faster than
+400 ms (each GET is a uvicorn access-log line).
+
+**HuggingFace `config.json`** (safetensors dirs, including nested
+`text_config`) fills the same architecture fields as a GGUF header, so the
+layers and experts panels work for vLLM and SGLang.
 
 A rescan aborts every poller and starts fresh ones for what it finds. Slots
 are matched to the new scan by PID, so a model that is still running keeps its

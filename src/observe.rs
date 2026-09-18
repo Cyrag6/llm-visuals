@@ -41,6 +41,17 @@ pub struct LiveStats {
     /// without this the finished request would look empty and its row
     /// would be dropped from the request table.
     pub closing: Option<ClosingRequest>,
+
+    /// SGLang without `--enable-metrics` does not report prefix-cache
+    /// hits; the context panel shows "—" instead of 0%.
+    pub cache_unknown: bool,
+    /// Server-reported weight occupancy in GiB (`/v1/loads` memory.weight_gb).
+    pub weight_gb: Option<f32>,
+    /// Server-reported KV-cache occupancy in GiB (`memory.kv_cache_gb`).
+    pub kv_cache_gb: Option<f32>,
+    /// Tokens currently occupying the KV pool (`num_used_tokens`). When
+    /// set, `ctx_used` prefers this over prompt+decoded.
+    pub kv_tokens: Option<usize>,
 }
 
 /// A vLLM request's full counters against the baseline in effect when it
@@ -59,9 +70,11 @@ pub struct ClosingRequest {
 
 impl LiveStats {
     pub fn ctx_used(&self) -> usize {
-        self.prompt_tokens
-            .saturating_add(self.decoded)
-            .max(self.cache_tokens)
+        self.kv_tokens.unwrap_or_else(|| {
+            self.prompt_tokens
+                .saturating_add(self.decoded)
+                .max(self.cache_tokens)
+        })
     }
 
     /// Fraction of the prompt that was served from the prefix cache.
@@ -294,6 +307,10 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         ttft_secs: 0.0,
         itl_sum: 0.0,
         closing: None,
+        cache_unknown: false,
+        weight_gb: None,
+        kv_cache_gb: None,
+        kv_tokens: None,
     })
 }
 

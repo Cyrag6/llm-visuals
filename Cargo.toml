@@ -1,6 +1,6 @@
 [package]
 name = "llm-visuals"
-version = "0.1.0"
+version = "0.8.0"
 edition = "2021"
 description = "Live terminal dashboard for a locally running LLM: throughput, GPUs, context, MTP acceptance, layer and expert activity"
 license = "MIT"
@@ -22,3 +22,12 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # No /proc outside Linux: process list, argv and per-process I/O come from here.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+
+# Distributed binaries: one codegen unit and cross-crate inlining, with the
+# debug symbols dropped. Unwinding stays on because the guard that leaves the
+# alternate screen restores the terminal from Drop, which a panic=abort build
+# would never run.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

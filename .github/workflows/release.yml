@@ -1,0 +1,122 @@
+# Builds the six release binaries — macOS, Windows and Linux, each on x86-64
+# and ARM64 — and attaches them to a GitHub release.
+#
+# Every target is built on a runner of its own architecture except
+# x86_64-apple-darwin, which cross-compiles from the ARM64 macOS runner: Apple
+# ships both architectures in one SDK, and Intel runners are on their way out.
+#
+# Push a tag to publish:  git tag v0.1.0 && git push origin v0.1.0
+# Or run it by hand from the Actions tab to get the archives as artifacts.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-15
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    env:
+      # Oldest macOS the binaries are expected to run on.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Only where the binary can actually run: the ARM64 runners are native,
+      # so the single exception is the Intel macOS build.
+      - name: Test
+        if: matrix.name != 'macos-x86_64'
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      # A tag names the version; a manual run falls back to Cargo.toml so the
+      # artifacts are not called "llm-visuals-main-...".
+      - name: Work out the archive name
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+            *)            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" ;;
+          esac
+          echo "STEM=llm-visuals-$version-${{ matrix.name }}" >> "$GITHUB_ENV"
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/$STEM.tar.gz" llm-visuals
+          # Linux has sha256sum, macOS has shasum.
+          (cd dist && { sha256sum "$STEM.tar.gz" || shasum -a 256 "$STEM.tar.gz"; } > "$STEM.tar.gz.sha256")
+
+      # Compress-Archive and Get-FileHash are built into PowerShell, so this
+      # needs nothing installed on either Windows runner.
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/llm-visuals.exe" -DestinationPath "dist/$env:STEM.zip"
+          $hash = (Get-FileHash "dist/$env:STEM.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:STEM.zip" | Out-File -Encoding ascii "dist/$env:STEM.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    # Manual runs leave the archives as workflow artifacts; only a tag makes
+    # a release out of them.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

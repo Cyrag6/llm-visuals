@@ -24,6 +24,8 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 
 - [Quick start](#quick-start)
 - [Windows](#windows)
+- [macOS](#macos)
+- [Building and cross-compiling](#building-and-cross-compiling)
 - [What you see](#what-you-see)
 - [Several models at once](#several-models-at-once)
 - [Keys](#keys)
@@ -42,7 +44,11 @@ Requirements: a Rust toolchain (1.75+), `nvidia-smi` on the path for GPU
 panels, and a locally listening `llama-server` for throughput panels. Nothing
 at all is needed for demo mode.
 
-On Windows 11, see [Windows](#windows) for setup.
+On Windows 11, see [Windows](#windows) for setup; on a Mac, see
+[macOS](#macos). Prebuilt binaries for all three, on x86-64 and ARM64, are
+attached to each [release](https://github.com/DingoOz/llm-visuals/releases) —
+see [Building and cross-compiling](#building-and-cross-compiling) to make your
+own.
 
 ```sh
 git clone https://github.com/DingoOz/llm-visuals
@@ -149,6 +155,91 @@ console, pass `--color truecolor` if colours look flat.
       written and the value is used at the next launch.
 - [ ] `--model <hf-id>` starts the Python bridge.
 - [ ] Resizing the window and very small window sizes.
+
+---
+
+## macOS
+
+macOS support is new and has only been type-checked, not run on a Mac yet.
+Both Apple silicon and Intel are built and released; please report results in
+an issue.
+
+Requirements are the same as elsewhere, minus the GPU panels: `nvidia-smi`
+does not exist on macOS, so the GPU row and the PCIe stage of the memory
+pipeline stay empty. Everything driven by the server's own metrics —
+throughput, context, MTP acceptance, layers and experts — works as it does on
+Linux.
+
+### What differs from Linux
+
+- **Detection** lists processes through the OS (via the `sysinfo` crate)
+  instead of `/proc`, exactly as on Windows. Run the dashboard as the same
+  user as the server, or the server's command line — and with it the model
+  path, port and context size — is hidden and it is matched by name alone.
+- **No GPU panels**: there is no `nvidia-smi`, so utilisation, VRAM, power and
+  temperature are unavailable, and Metal/unified memory is not read.
+- **Memory pipeline (`b`)**: RAM totals and the server's resident memory come
+  from the OS; the DISK and PCIe stages have no counters to read.
+- **Settings** go to `~/Library/Application Support/llm-visuals/settings.json`
+  and the log database to the same directory.
+
+---
+
+## Building and cross-compiling
+
+`cargo build --release` on the machine you want to run on is always the
+simplest route, and needs only a Rust toolchain and a C compiler (the SQLite
+used by `--log-db` is bundled as C source and built from scratch).
+
+Six targets are built and released:
+
+| | x86-64 | ARM64 |
+|---|---|---|
+| **Linux** | `x86_64-unknown-linux-gnu` | `aarch64-unknown-linux-gnu` |
+| **macOS** | `x86_64-apple-darwin` | `aarch64-apple-darwin` |
+| **Windows** | `x86_64-pc-windows-msvc` | `aarch64-pc-windows-msvc` |
+
+`.github/workflows/release.yml` builds all six on GitHub Actions — each on a
+runner of its own architecture, except the Intel Mac binary which
+cross-compiles from the ARM64 macOS runner — and attaches them to the release
+for a pushed `v*` tag. `.github/workflows/ci.yml` compiles and tests on all
+three operating systems on every pull request, and additionally cross-compiles
+the ARM and Windows targets that no runner there covers.
+
+### Cross-compiling locally
+
+`scripts/cross-build.sh` builds the same set from one machine and writes
+archives to `dist/`:
+
+```sh
+./scripts/cross-build.sh                 # every target this host can link
+./scripts/cross-build.sh windows-arm64   # or one at a time
+```
+
+Anything other than the host target needs [zig](https://ziglang.org/download/)
+and `cargo-zigbuild`, which supply the cross C compiler and linker that the
+bundled SQLite needs:
+
+```sh
+cargo install cargo-zigbuild
+pipx install ziglang          # or: brew install zig, or a tarball on the path
+```
+
+Two things to know about the result:
+
+- **Windows** binaries are built for the `*-pc-windows-gnullvm` targets rather
+  than `*-pc-windows-msvc`, because those are the ones zig can link. They are
+  ordinary `.exe` files that need no toolchain installed to run; the released
+  binaries are the msvc ones, built natively.
+- **macOS** binaries cannot be cross-compiled without Apple's SDK, which is
+  not redistributable: `sysinfo` links against the `CoreFoundation` and
+  `IOKit` frameworks, which zig does not carry. The script skips those two
+  targets unless `SDKROOT` points at a `MacOSX.sdk` you already have. Build
+  them on a Mac, or let the release workflow do it.
+
+Linux binaries are linked against glibc 2.28 by default so they run on
+distributions older than the build host; set `GLIBC=` to link against the
+host's own instead.
 
 ---
 

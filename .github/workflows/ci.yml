@@ -1,0 +1,61 @@
+# Every push is compiled and tested on all three operating systems, so a
+# change that only builds on Linux is caught before a release tag is cut.
+#
+# One runner per OS is enough for source portability: the cfg branches are
+# chosen by OS, not by architecture, and the release workflow covers both
+# architectures of each.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
+      # Formatting is the same everywhere, so one runner checks it.
+      # (No clippy gate here: the tree has pre-existing lints that would make
+      # this job red from the first run. Add it once those are cleared.)
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
+
+  # Compiles for the architectures no runner above covers, so an ARM-only
+  # build break shows up on the pull request rather than at release time.
+  cross:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-pc-windows-gnullvm
+          - x86_64-pc-windows-gnullvm
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      # zig is the C compiler and linker: the bundled SQLite is C, and nothing
+      # else supplies a cross-linker for these targets on a Linux runner.
+      - run: cargo install cargo-zigbuild --locked
+      - run: cargo zigbuild --release --locked --target ${{ matrix.target }}

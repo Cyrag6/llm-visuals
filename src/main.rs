@@ -94,6 +94,11 @@ impl ModelSlot {
     }
 }
 
+/// Cmdline `--api-key` / `--api-key-file` wins; otherwise the launch key file.
+fn auth_for(model: &DetectedModel, fallback: &HttpAuth) -> HttpAuth {
+    HttpAuth::from_token(model_detect::api_key_from(&model.cmdline)).or(fallback)
+}
+
 /// The servers to watch: everything detected, minus anything the `--pid`
 /// filter excludes, capped at `--max-models`.
 async fn discover(args: &Args, auth: &HttpAuth) -> Vec<DetectedModel> {
@@ -110,7 +115,7 @@ async fn discover(args: &Args, auth: &HttpAuth) -> Vec<DetectedModel> {
     for (index, model) in found.iter().enumerate() {
         if model.engine == "llama.cpp" && model.gguf.is_none() {
             if let Some(port) = model.port {
-                let auth = auth.clone();
+                let auth = auth_for(model, auth);
                 probes.spawn(async move { (index, observe::poll_llama_props(port, &auth).await) });
             }
         }
@@ -155,7 +160,7 @@ fn spawn_pollers(
             let experts_tx = experts_tx.clone();
             let context = PollContext {
                 others: others.clone(),
-                auth: auth.clone(),
+                auth: auth_for(&m, auth),
             };
             tokio::spawn(async move {
                 poll_server(m, port, live_tx, spec_tx, experts_tx, context, poll).await

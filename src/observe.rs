@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Optional bearer authentication shared by every inference-server probe.
+/// Optional bearer authentication for inference-server probes.
 /// The token itself never enters clap state, saved settings, or diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct HttpAuth(Option<Arc<str>>);
@@ -28,6 +28,25 @@ impl HttpAuth {
             ));
         }
         Ok(Self(Some(Arc::from(token))))
+    }
+
+    /// A token already in hand (for example `--api-key` on a server cmdline).
+    pub fn from_token(token: Option<String>) -> Self {
+        Self(
+            token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .map(Arc::from),
+        )
+    }
+
+    /// Prefer this key; fall back to `other` when this one is empty.
+    pub fn or(&self, other: &Self) -> Self {
+        if self.0.is_some() {
+            self.clone()
+        } else {
+            other.clone()
+        }
     }
 
     fn authorization_header(&self) -> String {
@@ -399,6 +418,18 @@ mod tests {
 
         let request = http_request("127.0.0.1", 11434, "/metrics", &HttpAuth::default());
         assert!(!request.contains("Authorization:"));
+
+        let detected = HttpAuth::from_token(Some("cmdline-key".into()));
+        let file = HttpAuth::from_token(Some("file-key".into()));
+        let request = http_request("127.0.0.1", 8080, "/slots", &detected.or(&file));
+        assert!(request.contains("Authorization: Bearer cmdline-key\r\n"));
+        let request = http_request(
+            "127.0.0.1",
+            8080,
+            "/slots",
+            &HttpAuth::from_token(None).or(&file),
+        );
+        assert!(request.contains("Authorization: Bearer file-key\r\n"));
     }
 
     #[test]

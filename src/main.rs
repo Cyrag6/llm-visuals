@@ -100,16 +100,28 @@ fn auth_for(model: &DetectedModel, fallback: &HttpAuth) -> HttpAuth {
 }
 
 /// The servers to watch: everything detected, minus anything the `--pid`
-/// filter excludes, capped at `--max-models`.
-async fn discover(args: &Args, auth: &HttpAuth) -> Vec<DetectedModel> {
+/// filter excludes, capped at `--max-models`. Returns detected models and an
+/// optional error note if an explicitly requested endpoint failed.
+async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
     let filter = args.pid_filter();
-    let mut found = Vec::new();
+    let mut explicit_models = Vec::new();
+    let mut explicit_error = None;
+    let explicit_ep = args.endpoint_url();
 
     // 1. Explicit endpoint URL (--endpoint, --model http://..., or LLM_ENDPOINT)
-    if let Some(ep) = args.endpoint_url() {
-        if let Some((host, port, path)) = model_detect::parse_endpoint(&ep) {
-            if let Some(m) = model_detect::probe_endpoint(&host, port, &path, auth).await {
-                found.push(m);
+    if let Some(ref ep) = explicit_ep {
+        match model_detect::parse_endpoint(ep) {
+            Ok((host, port, path)) => {
+                if let Some(m) = model_detect::probe_endpoint(&host, port, &path, auth).await {
+                    explicit_models.push(m);
+                } else {
+                    explicit_error = Some(format!(
+                        "failed to connect to inference server at {ep} (press r to retry)"
+                    ));
+                }
+            }
+            Err(e) => {
+                explicit_error = Some(format!("invalid endpoint '{ep}': {e}"));
             }
         }
     }
@@ -117,28 +129,26 @@ async fn discover(args: &Args, auth: &HttpAuth) -> Vec<DetectedModel> {
     // 2. Scan processes for running LLM servers
     let mut proc_models = model_detect::detect_models();
 
-    // 3. If no models found yet, probe local candidate endpoints (vLLM, llama.cpp, etc.)
-    if found.is_empty() {
-        let endpoint_models = model_detect::probe_local_endpoints(auth).await;
-        for m in endpoint_models {
-            if !proc_models.iter().any(|pm| pm.port == m.port) {
-                proc_models.push(m);
-            }
-        }
+    // 3. If no models found by process scan and no explicit endpoint was configured,
+    // probe local candidate endpoints (vLLM, llama.cpp, etc.)
+    if proc_models.is_empty() && explicit_ep.is_none() {
+        proc_models = model_detect::probe_local_endpoints(auth).await;
     }
 
-    // Merge discovered models, avoiding duplicate ports
+    // Filter process-detected models by PID if requested (exempt explicitly requested endpoints)
+    if !filter.is_empty() {
+        proc_models.retain(|m| filter.contains(&m.pid));
+    }
+
+    // Merge discovered models, avoiding duplicate ports or names
+    let mut found = explicit_models;
     for m in proc_models {
-        if !found
-            .iter()
-            .any(|fm| fm.port == m.port && fm.port.is_some())
-        {
+        let duplicate = found.iter().any(|fm| {
+            (fm.port.is_some() && fm.port == m.port) || (!fm.name.is_empty() && fm.name == m.name)
+        });
+        if !duplicate {
             found.push(m);
         }
-    }
-
-    if !filter.is_empty() {
-        found.retain(|m| filter.contains(&m.pid));
     }
     found.truncate(args.max_models.max(1));
     // `llama-server -hf owner/repo:quant` does not put a local GGUF path on
@@ -163,7 +173,7 @@ async fn discover(args: &Args, auth: &HttpAuth) -> Vec<DetectedModel> {
             }
         }
     }
-    found
+    (found, explicit_error)
 }
 
 /// One poller per model, each talking to its own server's port. They are
@@ -341,6 +351,18 @@ async fn poll_server(
             tokio::time::sleep(delay).await;
         }
     }
+    if model.engine == "ollama" {
+        // Ollama exposes /v1/models and /api/tags, but no /slots or Prometheus /metrics.
+        // Populate initial slot metadata and keep alive without spamming 404s.
+        let stats = LiveStats {
+            ctx_max: model.ctx_max.unwrap_or(0),
+            ..Default::default()
+        };
+        let _ = live_tx.try_send((pid, stats));
+        loop {
+            tokio::time::sleep(poll.max(Duration::from_secs(2))).await;
+        }
+    }
     let mut metrics_ok = true;
     let mut metrics_misses = 0u32;
     let mut experts_ok = true;
@@ -423,18 +445,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut theme_name = args.theme.clone();
     let theme = colors::get_theme(&theme_name);
 
-    let mut slots: Vec<ModelSlot> = if args.demo {
-        demo::demo_models(DEMO_CTX, args.demo_models)
-            .into_iter()
-            .map(ModelSlot::new)
-            .collect()
+    let (discovered, endpoint_err) = if args.demo {
+        (demo::demo_models(DEMO_CTX, args.demo_models), None)
     } else {
-        discover(&args, &auth)
-            .await
-            .into_iter()
-            .map(ModelSlot::new)
-            .collect()
+        discover(&args, &auth).await
     };
+    let mut slots: Vec<ModelSlot> = discovered.into_iter().map(ModelSlot::new).collect();
     let mut focus: usize = 0;
 
     let moe_experts = slots
@@ -446,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Opened before raw mode so a bad explicit path fails with a readable
     // error. The default location only turns logging off: it was not asked for.
-    let mut startup_note = launch.warning.clone();
+    let mut startup_note = endpoint_err.or_else(|| launch.warning.clone());
     let mut db = match open_db(&args) {
         Ok(db) => db,
         Err(e) if args.log_db == "auto" => {
@@ -505,8 +521,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (spec_tx, mut spec_rx) = mpsc::channel::<(u32, SpecMetrics)>(256);
     let (experts_tx, mut experts_rx) = mpsc::channel::<(u32, ExpertStats)>(64);
     let (host_tx, mut host_rx) = mpsc::channel::<Vec<(u32, HostSample)>>(64);
-    let (pids_tx, pids_rx) =
-        tokio::sync::watch::channel(slots.iter().map(|s| s.model.key()).collect::<Vec<u32>>());
+    let (pids_tx, pids_rx) = tokio::sync::watch::channel(
+        slots
+            .iter()
+            .filter_map(|s| {
+                if s.model.pid != 0 {
+                    Some(s.model.pid)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<u32>>(),
+    );
     let gpu_filter = args.gpu_indices();
     let mut poll = Duration::from_millis(args.poll_ms.max(50));
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
@@ -691,7 +717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h.abort();
             }
             // Keep the counters of models that are still up.
-            let found = discover(&args, &auth).await;
+            let (found, rescan_err) = discover(&args, &auth).await;
             let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
             for m in found {
                 match slots.iter().position(|s| s.model.key() == m.key()) {
@@ -715,7 +741,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enumerate()
                 .map(|(i, s)| (s.model.key(), i))
                 .collect();
-            let _ = pids_tx.send(slots.iter().map(|s| s.model.key()).collect());
+            let _ = pids_tx.send(
+                slots
+                    .iter()
+                    .filter_map(|s| {
+                        if s.model.pid != 0 {
+                            Some(s.model.pid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            );
             pollers = spawn_pollers(
                 &slots.iter().map(|s| s.model.clone()).collect::<Vec<_>>(),
                 &live_tx,
@@ -724,7 +761,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 poll,
                 &auth,
             );
-            status = status_for(&slots, true);
+            if let Some(err) = rescan_err {
+                status = err;
+            } else {
+                status = status_for(&slots, true);
+            }
         }
 
         let now = Instant::now();
@@ -778,6 +819,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (pid, h) in batch {
                 if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                     slot.perf.observe_host(&h, now);
+                } else if pid == 0 {
+                    for slot in &mut slots {
+                        slot.perf.observe_host(&h, now);
+                    }
                 }
             }
         }
@@ -1033,85 +1078,148 @@ fn fade_sample_from_live(
 mod tests {
     use super::*;
     use clap::Parser;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CANNED_VLLM_MODELS: &str = r#"{"object":"list","data":[{"id":"test-model","object":"model","created":1789774371,"owned_by":"vllm","max_model_len":4096}]}"#;
+    const CANNED_OLLAMA_MODELS: &str = r#"{"object":"list","data":[{"id":"llama3:latest","object":"model","created":1789774371,"owned_by":"library"}]}"#;
+    const CANNED_VLLM_METRICS: &str = "# HELP vllm:num_requests_running Number of requests currently running\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{model_name=\"test-model\"} 1\n";
+
+    async fn spawn_mock_server(
+        models_json: &'static str,
+        metrics_body: &'static str,
+    ) -> (u16, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    res = listener.accept() => {
+                        let (mut stream, _) = match res {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        };
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 1024];
+                            if let Ok(n) = stream.read(&mut buf).await {
+                                let req = String::from_utf8_lossy(&buf[..n]);
+                                let (body, ct) = if req.contains("/v1/models") || req.contains("/models") {
+                                    (models_json, "application/json")
+                                } else if req.contains("/metrics") {
+                                    (metrics_body, "text/plain")
+                                } else {
+                                    ("", "text/plain")
+                                };
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        (port, shutdown_tx)
+    }
 
     #[tokio::test]
     async fn discover_with_explicit_endpoint() {
-        let args = Args::try_parse_from(["llm-visuals", "--endpoint", "http://localhost:7000/v1"])
-            .unwrap();
+        let (port, _shutdown) = spawn_mock_server(CANNED_VLLM_MODELS, CANNED_VLLM_METRICS).await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args = Args::try_parse_from(["llm-visuals", "--endpoint", &ep]).unwrap();
         assert!(args.is_endpoint());
-        assert_eq!(
-            args.endpoint_url().as_deref(),
-            Some("http://localhost:7000/v1")
-        );
-        if tokio::net::TcpStream::connect(("127.0.0.1", 7000))
-            .await
-            .is_err()
-        {
-            eprintln!("Skipping live endpoint test: port 7000 is not reachable");
-            return;
-        }
-        let models = discover(&args, &HttpAuth::default()).await;
-        assert!(
-            !models.is_empty(),
-            "Expected to detect model from http://localhost:7000/v1"
-        );
-        let m = &models[0];
+        assert_eq!(args.endpoint_url().as_deref(), Some(ep.as_str()));
+
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none(), "Unexpected error: {err:?}");
+        let m = models
+            .iter()
+            .find(|m| m.port == Some(port))
+            .expect("explicit endpoint model");
         assert_eq!(m.engine, "vllm");
-        assert_eq!(m.port, Some(7000));
-        assert_eq!(m.name, "LFM-2.6B-Longevity");
-        assert_eq!(m.ctx_max, Some(32768));
-        assert_eq!(m.n_layers(), 30);
-        assert_eq!(m.n_heads(), 32);
-        assert!(!m.gpu_indices.is_empty());
+        assert_eq!(m.name, "test-model");
+        assert_eq!(m.ctx_max, Some(4096));
+        assert_eq!(m.pid, 0);
+        assert!(m.gpu_indices.is_empty());
     }
 
     #[tokio::test]
     async fn discover_with_model_url() {
-        let args =
-            Args::try_parse_from(["llm-visuals", "--model", "http://localhost:7000/v1"]).unwrap();
+        let (port, _shutdown) = spawn_mock_server(CANNED_VLLM_MODELS, CANNED_VLLM_METRICS).await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args = Args::try_parse_from(["llm-visuals", "--model", &ep]).unwrap();
         assert!(args.is_endpoint());
-        assert_eq!(
-            args.endpoint_url().as_deref(),
-            Some("http://localhost:7000/v1")
-        );
-        if tokio::net::TcpStream::connect(("127.0.0.1", 7000))
-            .await
-            .is_err()
-        {
-            eprintln!("Skipping live endpoint test: port 7000 is not reachable");
-            return;
-        }
-        let models = discover(&args, &HttpAuth::default()).await;
-        assert!(
-            !models.is_empty(),
-            "Expected model to be detected via --model URL"
-        );
-        let m = &models[0];
+        assert_eq!(args.endpoint_url().as_deref(), Some(ep.as_str()));
+
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none());
+        let m = models
+            .iter()
+            .find(|m| m.port == Some(port))
+            .expect("model URL endpoint");
         assert_eq!(m.engine, "vllm");
-        assert_eq!(m.port, Some(7000));
-        assert_eq!(m.name, "LFM-2.6B-Longevity");
-        assert_eq!(m.n_layers(), 30);
-        assert_eq!(m.n_heads(), 32);
+        assert_eq!(m.name, "test-model");
+        assert_eq!(m.pid, 0);
+        assert!(m.gpu_indices.is_empty());
     }
 
     #[tokio::test]
-    async fn discover_auto_finds_local_port_7000() {
-        let args = Args::try_parse_from(["llm-visuals", "--model", "auto"]).unwrap();
-        assert!(!args.is_endpoint());
-        if tokio::net::TcpStream::connect(("127.0.0.1", 7000))
-            .await
-            .is_err()
-        {
-            eprintln!("Skipping live endpoint test: port 7000 is not reachable");
-            return;
-        }
-        let models = discover(&args, &HttpAuth::default()).await;
-        assert!(
-            !models.is_empty(),
-            "Expected auto-detection to find local port 7000"
+
+    async fn discover_exempts_explicit_endpoint_from_pid_filter() {
+        let (port, _shutdown) = spawn_mock_server(CANNED_VLLM_MODELS, CANNED_VLLM_METRICS).await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args =
+            Args::try_parse_from(["llm-visuals", "--endpoint", &ep, "--pid", "999999"]).unwrap();
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none());
+        assert_eq!(
+            models.len(),
+            1,
+            "Explicit endpoint should not be dropped by pid filter"
         );
-        let m = &models[0];
-        assert_eq!(m.engine, "vllm");
-        assert_eq!(m.port, Some(7000));
+        assert_eq!(models[0].pid, 0);
+    }
+
+    #[tokio::test]
+    async fn discover_detects_ollama_server() {
+        let (port, _shutdown) = spawn_mock_server(CANNED_OLLAMA_MODELS, "").await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args = Args::try_parse_from(["llm-visuals", "--endpoint", &ep]).unwrap();
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none());
+        let m = models
+            .iter()
+            .find(|m| m.port == Some(port))
+            .expect("ollama endpoint");
+        assert_eq!(m.engine, "ollama");
+        assert_eq!(m.name, "llama3:latest");
+        assert_eq!(m.pid, 0);
+    }
+
+    #[tokio::test]
+    async fn discover_reports_unreachable_explicit_endpoint() {
+        let args =
+            Args::try_parse_from(["llm-visuals", "--endpoint", "http://127.0.0.1:1/v1"]).unwrap();
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_some());
+        assert!(err
+            .unwrap()
+            .contains("failed to connect to inference server"));
+        assert!(
+            models.iter().all(|m| m.port != Some(1)),
+            "unreachable explicit port must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_reports_unsupported_https_endpoint() {
+        let args = Args::try_parse_from(["llm-visuals", "--endpoint", "https://localhost:7000/v1"])
+            .unwrap();
+        let (_models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("HTTPS is not supported"));
     }
 }

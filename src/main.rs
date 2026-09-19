@@ -546,11 +546,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         status = note;
     }
     let mut settings_form: Option<settings::SettingsForm> = None;
+    let mut last_visual_activity = Instant::now();
 
     loop {
         tokio::task::yield_now().await;
         let mut rescan = false;
+        let mut ui_changed = false;
         if event::poll(Duration::from_millis(0))? {
+            ui_changed = true;
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press && settings_form.is_some() {
                     let form = settings_form.as_mut().unwrap();
@@ -645,6 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if rescan {
+            ui_changed = true;
             for h in pollers.drain(..) {
                 h.abort();
             }
@@ -688,6 +692,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let mut gpu_updated = false;
         while let Ok(sample) = gpu_rx.try_recv() {
+            ui_changed = true;
             match sample {
                 Ok(stats) => {
                     latest_gpu = stats;
@@ -707,6 +712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slot.routing = None;
         }
         while let Ok((pid, e)) = experts_rx.try_recv() {
+            ui_changed = true;
             let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) else {
                 continue;
             };
@@ -724,11 +730,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slot.experts = Some(e);
         }
         while let Ok((pid, m)) = spec_rx.try_recv() {
+            ui_changed = true;
             if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                 slot.perf.observe_spec(&m, now);
             }
         }
         while let Ok(batch) = host_rx.try_recv() {
+            ui_changed = true;
             for (pid, h) in batch {
                 if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                     slot.perf.observe_host(&h, now);
@@ -736,6 +744,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         while let Ok((pid, s)) = live_rx.try_recv() {
+            ui_changed = true;
             if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                 if s.ctx_max > 0 {
                     slot.ctx_max = s.ctx_max;
@@ -746,6 +755,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         while let Ok(event) = events_rx.try_recv() {
+            ui_changed = true;
             match event {
                 llm::LlmEvent::ModelInfo {
                     num_layers: nl,
@@ -810,8 +820,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Keep the dashboard up; stop writing and say why.
                 status = format!("--log-db stopped: {e}");
                 db = None;
+                ui_changed = true;
             }
         }
+
+        // Preserve the 30 FPS animation cadence while a request is active and
+        // while its heat/fade effects settle. Once fully idle, redraw only for
+        // fresh telemetry or input instead of flushing identical terminal
+        // frames 30 times per second. GPU samples still arrive every 200 ms.
+        if slots.iter().any(|slot| slot.live.processing) {
+            last_visual_activity = now;
+        }
+        let animate = now.duration_since(last_visual_activity) < Duration::from_secs(3);
 
         focus = focus.min(slots.len().saturating_sub(1));
         let views: Vec<ModelView> = slots.iter().map(ModelSlot::view).collect();
@@ -839,7 +859,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             experts: cur.and_then(|v| v.experts),
             settings: settings_form.as_ref(),
         };
-        renderer.render_frame(&mut terminal, &dash);
+        if animate || ui_changed {
+            renderer.render_frame(&mut terminal, &dash);
+        }
 
         if !running && !done {
             break;

@@ -89,3 +89,13 @@
 - **Root cause:** `used_gpu_memory` was parsed with `continue` on error; Windows (WDDM) drivers always report `[N/A]`, so every GPU process vanished from detection.
 - **Fix applied:** Parse the column with `unwrap_or(0)` so the process is kept with unknown memory.
 - **Prevention rule:** When parsing `nvidia-smi` (or similar) CSV, only skip a row when its identity columns (pid, uuid, index) fail to parse; default non-key numeric columns.
+
+### Discover tests assumed an empty host process table — 2026-09-20
+
+- **Severity:** Low
+- **Category:** Logic
+- **File(s):** `src/main.rs`
+- **Pattern:** An integration test of `discover()` asserting `models.is_empty()` or `models.len() == 1` for an explicit `--endpoint`, while production still scans the host process table and can attach extra real servers.
+- **Root cause:** Mock-server tests were written on a machine with no llama-server running, so process detection returned nothing and the assertions only covered the mock.
+- **Fix applied:** Assert the explicit endpoint is present (and error text for failures) without requiring it to be the only detected model.
+- **Prevention rule:** Tests that call `discover()` must select the model under test by port/name; never assert the whole result set is empty or length 1 unless process scanning is stubbed.

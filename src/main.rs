@@ -9,6 +9,7 @@ mod gpu;
 mod host;
 mod llm;
 mod model_detect;
+pub mod nvml;
 mod observe;
 mod perf;
 mod pipeline;
@@ -25,7 +26,7 @@ use crossterm::{
 };
 use fade::{FadeSample, FadeState};
 use gguf::layer_device;
-use gpu::{GpuMonitor, GpuSample, GpuStats};
+use gpu::{GpuBackend, GpuMonitor, GpuSample, GpuStats};
 use host::{HostMonitor, HostSample};
 use model_detect::DetectedModel;
 use observe::{ExpertStats, HttpAuth, LiveStats, SpecMetrics};
@@ -35,6 +36,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use render::{Dashboard, ModelView, Renderer};
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -537,6 +539,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut poll = Duration::from_millis(args.poll_ms.max(50));
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
 
+    let (gpu_backend, nvml_host, backend_name) = if args.demo {
+        (None, None, "demo")
+    } else {
+        let nvml = if args.no_nvml {
+            None
+        } else {
+            nvml::NvmlSession::new()
+        };
+        let backend = Arc::new(GpuBackend::detect(nvml));
+        let nvml_host = match backend.as_ref() {
+            GpuBackend::Nvml(session) => Some(session.clone()),
+            _ => None,
+        };
+        let name = backend.name();
+        (Some(backend), nvml_host, name)
+    };
+
     if args.demo {
         let n = if gpu_filter.is_empty() {
             2
@@ -562,12 +581,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poll,
             &auth,
         );
+        let gpu_backend_poll = Arc::clone(gpu_backend.as_ref().unwrap());
         tokio::spawn(async move {
-            GpuMonitor::new().run(gpu_tx, gpu_filter).await;
+            GpuMonitor::new(gpu_backend_poll)
+                .run(gpu_tx, gpu_filter)
+                .await;
         });
         tokio::spawn(async move {
             // Host counters at half the GPU polling rate are plenty.
-            HostMonitor::new(poll.max(Duration::from_millis(400)))
+            HostMonitor::new(poll.max(Duration::from_millis(400)), nvml_host)
                 .run(host_tx, pids_rx)
                 .await;
         });
@@ -582,8 +604,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut latest_gpu: Vec<GpuStats> = Vec::new();
     let mut gpu_error: Option<String> = None;
-    if !args.demo {
-        match GpuMonitor::collect_once() {
+    if let Some(backend) = &gpu_backend {
+        match GpuMonitor::collect_once(backend) {
             Ok(stats) => latest_gpu = gpu::filter_gpus(stats, &args.gpu_indices()),
             Err(e) => gpu_error = Some(e),
         }
@@ -934,6 +956,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             detected: cur.map(|v| v.detected),
             gpus: &latest_gpu,
             gpu_error: gpu_error.as_deref(),
+            gpu_backend: Some(backend_name),
             fade: cur.map(|v| v.fade).unwrap_or(&empty_fade),
             perf: cur.map(|v| v.perf).unwrap_or(&empty_perf),
             live: cur.map(|v| v.live).unwrap_or(&empty_live),

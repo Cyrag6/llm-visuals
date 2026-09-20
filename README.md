@@ -410,7 +410,7 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | tok/J | decode tok/s ÷ summed GPU power draw |
 | cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—") |
 | request log | one record per `id_task`; averages from accumulated deltas |
-| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA `nvidia-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll |
+| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), or Linux amdgpu sysfs and hwmon, every poll |
 | VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads` |
 | layers, heads, experts, MTP layers, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
 | layer → GPU | `--tensor-split` proportions |
@@ -420,7 +420,7 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | MTP acceptance, tok/step, steps/s | deltas of `spec_decode_num_draft_tokens_total`, `…accepted_tokens_total`, `…drafts_total` from `GET /metrics`, 1.5 s window |
 | disk MB/s, faults/s | deltas of sectors read in `/proc/diskstats` (whole disks), `read_bytes` in `/proc/<pid>/io`, `majflt` in `/proc/<pid>/stat` |
 | resident weights | `RssFile` in `/proc/<pid>/status` |
-| PCIe MB/s | `nvidia-smi dmon -s t -c 1` rx/tx per GPU; samples above the link cap are dropped (dmon emits the odd garbage row) |
+| PCIe MB/s | in-process NVML `nvmlDeviceGetPcieThroughput` (`nvidia-smi dmon -s t -c 1` fallback) rx/tx per GPU; samples above the link cap are dropped (dmon emits the odd garbage row) |
 | VRAM busy % | NVIDIA `utilization.memory` or AMD `mem_busy_percent` (memory-controller busy time) |
 | bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps, summed over every shard of a split file), expert tensors × used/total, embedding and engram tables excluded, split CPU vs GPU by what the cards hold, × steps/s |
 
@@ -507,6 +507,7 @@ MTP.
 --max-models N       most models to watch at once (default 8)
 --pid A,B            only watch these PIDs (default: every model found)
 --gpu 0,1            GPU indices to show (default: all)
+--no-nvml            use nvidia-smi subprocesses instead of native NVML telemetry
 --poll-ms 200        sampling interval for the server and GPU telemetry
 --api-key-file PATH  bearer token file for inference-server HTTP requests
 --color auto|truecolor|256
@@ -652,10 +653,11 @@ src/
 ├── render.rs        panels, gauges, sparklines, big digits
 ├── perf.rs          rates, TTFT, request records, MTP stats, VU meters
 ├── bandwidth.rs     weight layout and the bottleneck verdict
-├── host.rs          /proc disk, faults, RSS; nvidia-smi dmon PCIe
+├── host.rs          /proc disk, faults, RSS; in-process NVML PCIe (dmon fallback)
 ├── fade.rs          smoothing and expert heat
 ├── observe.rs       /slots, /metrics, /experts parsers
 ├── gpu.rs           NVIDIA/AMD collectors, demo GPUs
+├── nvml.rs          in-process NVML driver bindings & PCIe throughput
 ├── model_detect.rs  finds the servers, parses their command lines
 ├── gguf.rs          GGUF header reader, layer → GPU mapping
 ├── demo.rs          synthetic servers for --demo

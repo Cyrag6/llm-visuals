@@ -22,12 +22,12 @@ GPUs and the disk are shared.
       :8081     └──────────────┘                           └──────┬────────┘
                                                                   │ mpsc channels
                 ┌──────────────┐  every 200 ms, shared            │
- nvidia-smi ────┤ --query-gpu  ├──────────────► gpu.rs ───────────┤
-                └──────────────┘                GpuStats          │
+  NVML / SMI ───┤ telemetry    ├──────────────► gpu.rs ───────────┤
+  or amdgpu     └──────────────┘                GpuStats          │
                 ┌──────────────┐  every 400 ms, one pass          │
- /proc ─────────┤ diskstats    ├──────────────► host.rs ──────────┤
- nvidia-smi ────┤ pid/io,stat  │            Vec<(pid,HostSample)> │
-                │ dmon -s t    │                                  ▼
+  /proc ────────┤ diskstats    ├──────────────► host.rs ──────────┤
+  NVML / dmon ──┤ pid/io,stat  │            Vec<(pid,HostSample)> │
+                │ pcie rx/tx   │                                  ▼
                 └──────────────┘              ┌─────────────────────────────────┐
                                               │ main.rs event loop  ~30 fps     │
  model_detect.rs ─ /proc + compute apps ─────►│ routes each sample by pid into  │
@@ -63,9 +63,10 @@ GPUs and the disk are shared.
 | `observe.rs` | HTTP GET with timeouts; parsers for `/slots`, `/metrics` (Prometheus text) and `/experts` |
 | `vllm.rs` | vLLM `/metrics` adapter: reconstructs per-request `LiveStats` from engine-wide Prometheus counters |
 | `sglang.rs` | SGLang adapter: `GET /v1/loads?include=all` plus one-shot `/server_info`; optional `sglang:realtime_tokens_total` |
-| `gpu.rs` | `nvidia-smi` CSV collector on a `spawn_blocking` thread; smooth random-walk demo GPUs |
+| `gpu.rs` | in-process NVML telemetry collector (falling back to `nvidia-smi` CSV) or Linux amdgpu sysfs on a `spawn_blocking` thread; smooth random-walk demo GPUs |
+| `nvml.rs` | dynamically loads `nvml.dll` or `libnvidia-ml.so`; maintains a persistent in-process session for GPU metrics and PCIe throughput without subprocess overhead |
 | `perf.rs` | turns counter samples into rates with `RateWindow` (sliding window), tracks requests, TTFT, peaks, MTP acceptance, history ring buffers; `Meter` (VU channel with peak hold and auto scale) and `BandwidthStats` for the pipeline view |
-| `host.rs` | host counters: `/proc/diskstats`, `/proc/<pid>/io`, `/proc/<pid>/stat` (major faults), `/proc/<pid>/status` (`RssFile`), `/proc/meminfo`, and PCIe rx/tx per GPU from `nvidia-smi dmon -s t -c 1`. The system-wide reads happen once per poll and are shared across every PID, so watching six models costs the same `nvidia-smi` calls as watching one |
+| `host.rs` | host counters: `/proc/diskstats`, `/proc/<pid>/io`, `/proc/<pid>/stat` (major faults), `/proc/<pid>/status` (`RssFile`), `/proc/meminfo`, and PCIe rx/tx per GPU via NVML `nvmlDeviceGetPcieThroughput` (with `nvidia-smi dmon` fallback). In-process NVML eliminates repeated CLI subprocess spawns completely |
 | `bandwidth.rs` | `weight_layout` (bytes total / active / CPU-side from the GGUF tensor table and VRAM use) and `assess`, the rule chain that names the bottleneck stage |
 | `fade.rs` | time-based smoothing so the UI breathes: fast attack, slow release; per-expert heat that cools exponentially |
 | `demo.rs` | synthetic servers (`--demo-models N`, each a prefill → decode → idle loop with its own profile) emitting `LiveStats`, `SpecMetrics` and `ExpertStats` through the same tagged channels; one extra task walks the shared GPUs and host counters from their combined load |

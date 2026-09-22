@@ -144,12 +144,13 @@ fn label_value(set: &str, key: &str) -> Option<String> {
 /// container port-publish collision, where accepting would silently show
 /// the other model's counters.
 pub async fn poll_vllm(
+    host: &str,
     port: u16,
     expected_name: &str,
     other_models: &[(String, u16)],
     auth: &HttpAuth,
 ) -> Option<VllmCounters> {
-    let body = http_get("127.0.0.1", port, "/metrics", auth).await.ok()?;
+    let body = http_get(host, port, "/metrics", auth).await.ok()?;
     let c = parse_vllm_metrics(&body)?;
     if c.model_name
         .as_deref()
@@ -313,6 +314,7 @@ impl VllmAdapter {
             prompt_tokens: prompt_req + cached_req,
             prompt_processed: prompt_req,
             decoded: decoded_req,
+            decoded_present: true,
             cache_tokens: cached_req,
             processing: running,
             spec_types: if spec_active {

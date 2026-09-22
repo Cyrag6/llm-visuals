@@ -13,6 +13,10 @@ pub struct DetectedModel {
     pub engine: String,
     pub gpu_indices: Vec<u32>,
     pub mem_used_mb: u64,
+    /// Address the pollers dial. A wildcard bind (`0.0.0.0`, `::`) stays
+    /// on loopback, which can still reach it. A specific `--host` is kept,
+    /// because `127.0.0.1` then refuses the connection.
+    pub host: String,
     pub port: Option<u16>,
     pub ctx_max: Option<usize>,
     pub spec_type: Option<String>,
@@ -501,6 +505,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
             engine: parsed.engine.clone(),
             gpu_indices: Vec::new(),
             mem_used_mb: 0,
+            host: parsed.host.clone(),
             port: parsed.port,
             ctx_max: parsed.ctx_max,
             spec_type: parsed.spec_type.clone(),
@@ -551,6 +556,7 @@ pub fn detect_models() -> Vec<DetectedModel> {
                 engine: parsed.engine,
                 gpu_indices: Vec::new(),
                 mem_used_mb: 0,
+                host: parsed.host,
                 port: parsed.port,
                 ctx_max: parsed.ctx_max,
                 spec_type: parsed.spec_type,
@@ -637,6 +643,7 @@ fn is_self(pid: u32, cmdline: &str) -> bool {
 #[derive(Default)]
 struct ParsedCmd {
     name: String,
+    host: String,
     path: Option<PathBuf>,
     engine: String,
     port: Option<u16>,
@@ -831,6 +838,16 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
                     }
                 }
             }
+            // llama-server (and vLLM, SGLang) bind with `--host`. Polling
+            // loopback after `--host 192.168.x.x` connects nowhere.
+            "--host" => {
+                if let Some(v) = next() {
+                    parsed.host = connect_host(&v);
+                    if inline.is_none() {
+                        i += 1;
+                    }
+                }
+            }
             "--ctx-size" | "--ctx_size" | "-c" => {
                 if let Some(v) = next() {
                     parsed.ctx_max = v.parse().ok();
@@ -964,7 +981,30 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     if parsed.port.is_none() && parsed.engine == "sglang" {
         parsed.port = Some(30000);
     }
+    if parsed.host.is_empty() {
+        parsed.host = "127.0.0.1".into();
+    }
     parsed
+}
+
+/// Address to dial for a `--host` value. Wildcard binds accept local
+/// connections; a concrete address does not.
+fn connect_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if bare.is_empty()
+        || bare.eq_ignore_ascii_case("localhost")
+        || bare == "0.0.0.0"
+        || bare == "::"
+        || bare == "*"
+    {
+        "127.0.0.1".into()
+    } else {
+        bare.to_string()
+    }
 }
 
 /// The server's API key: `--api-key` (first of a comma list) or the first
@@ -1523,6 +1563,7 @@ pub async fn probe_endpoint(
         engine,
         gpu_indices,
         mem_used_mb: 0,
+        host: host.to_string(),
         port: Some(port),
         ctx_max,
         spec_type: None,
@@ -1537,22 +1578,31 @@ pub async fn probe_endpoint(
 /// Probe candidate local ports for running inference servers.
 pub async fn probe_local_endpoints(auth: &crate::observe::HttpAuth) -> Vec<DetectedModel> {
     const CANDIDATES: &[u16] = &[7000, 8000, 8080, 11434, 30000, 5000, 8001, 8081, 7001];
+    // A server bound to a LAN address never accepts a loopback connection.
+    // The process scan reads `--host` when it can see the command line;
+    // this probe covers the case where it cannot (another user, a container
+    // publish). Linux reads the addresses from this process's fib_trie
+    // rather than shelling out, and only a handful, so a box full of
+    // virtual interfaces does not turn startup into a port scan.
+    let hosts = probe_hosts();
     let mut tasks = tokio::task::JoinSet::new();
     for &port in CANDIDATES {
-        let auth = auth.clone();
-        tasks.spawn(async move {
-            let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
-            if tokio::time::timeout(std::time::Duration::from_millis(60), connect)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .is_some()
-            {
-                probe_endpoint("127.0.0.1", port, "", &auth).await
-            } else {
-                None
-            }
-        });
+        for host in hosts.clone() {
+            let auth = auth.clone();
+            tasks.spawn(async move {
+                let connect = tokio::net::TcpStream::connect((host.as_str(), port));
+                if tokio::time::timeout(std::time::Duration::from_millis(60), connect)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .is_some()
+                {
+                    probe_endpoint(&host, port, "", &auth).await
+                } else {
+                    None
+                }
+            });
+        }
     }
 
     let mut models = Vec::new();
@@ -1562,6 +1612,31 @@ pub async fn probe_local_endpoints(auth: &crate::observe::HttpAuth) -> Vec<Detec
         }
     }
     models
+}
+
+fn probe_hosts() -> Vec<String> {
+    let mut hosts = vec!["127.0.0.1".to_string()];
+    #[cfg(target_os = "linux")]
+    if let Some(ips) = netns_ipv4s(std::process::id()) {
+        for ip in extra_probe_ips(&ips) {
+            if !hosts.contains(&ip) {
+                hosts.push(ip);
+            }
+        }
+    }
+    hosts
+}
+
+/// Non-loopback addresses worth a short connect attempt. Link-local and
+/// the wildcard are not places a server is dialed.
+fn extra_probe_ips(ips: &[String]) -> Vec<String> {
+    ips.iter()
+        .filter(|ip| {
+            !ip.starts_with("127.") && ip.as_str() != "0.0.0.0" && !ip.starts_with("169.254.")
+        })
+        .take(7)
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1578,10 +1653,43 @@ mod tests {
         assert_eq!(p.spec_type.as_deref(), Some("draft-mtp"));
         assert_eq!(p.tensor_split, vec![63.0, 37.0]);
         assert_eq!(p.engine, "llama.cpp");
+        // `--host 0.0.0.0` still answers on loopback. Dialing 0.0.0.0 does not.
+        assert_eq!(p.host, "127.0.0.1");
         assert!(p
             .path
             .unwrap()
             .ends_with("Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf"));
+    }
+
+    #[test]
+    fn host_flag_is_the_address_pollers_dial() {
+        let lan = parse_cmdline(
+            "llama-server",
+            "llama-server -m m.gguf --host 192.168.90.171 --port 8085",
+        );
+        assert_eq!(lan.host, "192.168.90.171");
+        let eq = parse_cmdline("llama-server", "llama-server -m m.gguf --host=10.0.0.5");
+        assert_eq!(eq.host, "10.0.0.5");
+        let absent = parse_cmdline("llama-server", "llama-server -m m.gguf");
+        assert_eq!(absent.host, "127.0.0.1");
+        assert_eq!(connect_host("localhost"), "127.0.0.1");
+        assert_eq!(connect_host("[::]"), "127.0.0.1");
+        assert_eq!(connect_host("::1"), "::1");
+    }
+
+    #[test]
+    fn lan_probe_skips_loopback_and_link_local() {
+        let ips = vec![
+            "127.0.0.1".into(),
+            "0.0.0.0".into(),
+            "169.254.1.1".into(),
+            "172.17.0.3".into(),
+            "192.168.90.171".into(),
+        ];
+        assert_eq!(
+            extra_probe_ips(&ips),
+            vec!["172.17.0.3".to_string(), "192.168.90.171".to_string()]
+        );
     }
 
     // LM Studio's spawned llama-server: an ephemeral port, a fresh API key
@@ -1909,6 +2017,7 @@ mod tests {
             engine: "vllm".into(),
             gpu_indices: vec![],
             mem_used_mb: 0,
+            host: "127.0.0.1".into(),
             port: Some(7000),
             ctx_max: Some(4096),
             spec_type: None,

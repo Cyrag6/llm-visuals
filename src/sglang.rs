@@ -201,9 +201,9 @@ fn json_num(v: &Value) -> Option<f64> {
         .or_else(|| v.as_u64().map(|n| n as f64))
 }
 
-pub async fn poll_server_info(port: u16, auth: &HttpAuth) -> Option<SglangServerInfo> {
+pub async fn poll_server_info(host: &str, port: u16, auth: &HttpAuth) -> Option<SglangServerInfo> {
     for path in ["/server_info", "/get_server_info"] {
-        if let Ok(body) = http_get("127.0.0.1", port, path, auth).await {
+        if let Ok(body) = http_get(host, port, path, auth).await {
             if let Some(info) = parse_server_info(&body) {
                 return Some(info);
             }
@@ -212,9 +212,9 @@ pub async fn poll_server_info(port: u16, auth: &HttpAuth) -> Option<SglangServer
     None
 }
 
-pub async fn poll_loads(port: u16, auth: &HttpAuth) -> Option<SglangLoads> {
+pub async fn poll_loads(host: &str, port: u16, auth: &HttpAuth) -> Option<SglangLoads> {
     for path in ["/v1/loads?include=all", "/v1/loads", "/get_load"] {
-        if let Ok(body) = http_get("127.0.0.1", port, path, auth).await {
+        if let Ok(body) = http_get(host, port, path, auth).await {
             if let Some(c) = parse_loads(&body) {
                 return Some(c);
             }
@@ -223,8 +223,8 @@ pub async fn poll_loads(port: u16, auth: &HttpAuth) -> Option<SglangLoads> {
     None
 }
 
-pub async fn poll_sglang_metrics(port: u16, auth: &HttpAuth) -> Option<SglangMetrics> {
-    let body = http_get("127.0.0.1", port, "/metrics", auth).await.ok()?;
+pub async fn poll_sglang_metrics(host: &str, port: u16, auth: &HttpAuth) -> Option<SglangMetrics> {
+    let body = http_get(host, port, "/metrics", auth).await.ok()?;
     parse_sglang_metrics(&body)
 }
 
@@ -371,6 +371,7 @@ impl SglangAdapter {
             prompt_tokens,
             prompt_processed,
             decoded,
+            decoded_present: true,
             cache_tokens,
             processing: running,
             spec_types: String::new(),

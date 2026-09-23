@@ -23,6 +23,22 @@ pub struct NvmlMemory {
     pub used: u64,
 }
 
+/// `nvmlMemory_v2_t`: `used` excludes the driver's `reserved` carve-out, which is
+/// what nvidia-smi's `memory.used` reports. The v1 struct folds reserved into
+/// used, overstating an idle card by a few hundred MB.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NvmlMemoryV2 {
+    pub version: u32,
+    pub total: u64,
+    pub reserved: u64,
+    pub free: u64,
+    pub used: u64,
+}
+
+/// NVML_STRUCT_VERSION(Memory, 2): struct size in the low bits, version << 24.
+const NVML_MEMORY_V2: u32 = std::mem::size_of::<NvmlMemoryV2>() as u32 | (2 << 24);
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NvmlUtilization {
@@ -47,6 +63,7 @@ type FnNvmlDeviceGetCount = unsafe extern "C" fn(*mut u32) -> u32;
 type FnNvmlDeviceGetHandleByIndex = unsafe extern "C" fn(u32, *mut *mut c_void) -> u32;
 type FnNvmlDeviceGetName = unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> u32;
 type FnNvmlDeviceGetMemoryInfo = unsafe extern "C" fn(*mut c_void, *mut NvmlMemory) -> u32;
+type FnNvmlDeviceGetMemoryInfoV2 = unsafe extern "C" fn(*mut c_void, *mut NvmlMemoryV2) -> u32;
 type FnNvmlDeviceGetUtilizationRates =
     unsafe extern "C" fn(*mut c_void, *mut NvmlUtilization) -> u32;
 type FnNvmlDeviceGetTemperature = unsafe extern "C" fn(*mut c_void, u32, *mut u32) -> u32;
@@ -160,6 +177,7 @@ pub struct NvmlSession {
     device_get_handle_by_index_fn: FnNvmlDeviceGetHandleByIndex,
     device_get_name_fn: FnNvmlDeviceGetName,
     device_get_memory_info_fn: FnNvmlDeviceGetMemoryInfo,
+    device_get_memory_info_v2_fn: Option<FnNvmlDeviceGetMemoryInfoV2>,
     device_get_utilization_rates_fn: FnNvmlDeviceGetUtilizationRates,
     device_get_temperature_fn: FnNvmlDeviceGetTemperature,
     device_get_power_usage_fn: FnNvmlDeviceGetPowerUsage,
@@ -235,6 +253,12 @@ impl NvmlSession {
             sym!(lib, b"nvmlDeviceGetName\0", FnNvmlDeviceGetName);
         let device_get_memory_info_fn: FnNvmlDeviceGetMemoryInfo =
             sym!(lib, b"nvmlDeviceGetMemoryInfo\0", FnNvmlDeviceGetMemoryInfo);
+        // R510+; older drivers only have v1.
+        let device_get_memory_info_v2_fn = opt_sym!(
+            lib,
+            b"nvmlDeviceGetMemoryInfo_v2\0",
+            FnNvmlDeviceGetMemoryInfoV2
+        );
         let device_get_utilization_rates_fn: FnNvmlDeviceGetUtilizationRates = sym!(
             lib,
             b"nvmlDeviceGetUtilizationRates\0",
@@ -306,6 +330,7 @@ impl NvmlSession {
             device_get_handle_by_index_fn,
             device_get_name_fn,
             device_get_memory_info_fn,
+            device_get_memory_info_v2_fn,
             device_get_utilization_rates_fn,
             device_get_temperature_fn,
             device_get_power_usage_fn,
@@ -346,6 +371,26 @@ impl NvmlSession {
         Ok(count)
     }
 
+    /// Memory in nvidia-smi's terms (reserved excluded from used), via v2 when the
+    /// driver has it, else v1.
+    fn memory_info(&self, handle: *mut c_void) -> Option<NvmlMemory> {
+        if let Some(v2_fn) = self.device_get_memory_info_v2_fn {
+            let mut m = NvmlMemoryV2 {
+                version: NVML_MEMORY_V2,
+                ..Default::default()
+            };
+            if unsafe { v2_fn(handle, &mut m) } == NVML_SUCCESS {
+                return Some(NvmlMemory {
+                    total: m.total,
+                    free: m.free,
+                    used: m.used,
+                });
+            }
+        }
+        let mut m = NvmlMemory::default();
+        (unsafe { (self.device_get_memory_info_fn)(handle, &mut m) } == NVML_SUCCESS).then_some(m)
+    }
+
     /// Query stats for all NVIDIA GPUs currently online.
     pub fn collect_stats(&self) -> Result<Vec<GpuStats>, String> {
         let count = self.device_count()?;
@@ -379,10 +424,7 @@ impl NvmlSession {
             // device that cannot answer one of them (NOT_SUPPORTED on MIG, for one)
             // keeps its row with zeros, the way nvidia-smi printed [N/A]. Dropping it
             // instead would silently shrink the panel and understate summed watts.
-            let mut mem = NvmlMemory::default();
-            if unsafe { (self.device_get_memory_info_fn)(handle, &mut mem) } != NVML_SUCCESS {
-                mem = NvmlMemory::default();
-            }
+            let mem = self.memory_info(handle).unwrap_or_default();
             let mem_total_mb = bytes_to_mb(mem.total);
             let mem_used_mb = bytes_to_mb(mem.used);
             let mem_free_mb = bytes_to_mb(mem.free);
@@ -547,8 +589,10 @@ pub(crate) fn decode_device_name(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..len]).trim().to_string()
 }
 
+/// Nearest MiB, as nvidia-smi prints it; truncating read 1 MB low against
+/// the --no-nvml path.
 pub(crate) fn bytes_to_mb(bytes: u64) -> u64 {
-    bytes / (1024 * 1024)
+    (bytes + 512 * 1024) / (1024 * 1024)
 }
 
 pub(crate) fn kb_to_mb(kb: u32) -> f32 {
@@ -573,13 +617,23 @@ mod tests {
     #[test]
     fn test_conversions() {
         assert_eq!(bytes_to_mb(0), 0);
-        assert_eq!(bytes_to_mb(1024 * 1024 - 1), 0);
+        assert_eq!(bytes_to_mb(512 * 1024 - 1), 0);
+        assert_eq!(bytes_to_mb(512 * 1024), 1);
+        assert_eq!(bytes_to_mb(1024 * 1024 - 1), 1);
         assert_eq!(bytes_to_mb(1024 * 1024), 1);
         assert_eq!(bytes_to_mb(16 * 1024 * 1024 * 1024), 16384);
 
         assert_eq!(kb_to_mb(0), 0.0);
         assert_eq!(kb_to_mb(1024), 1.0);
         assert_eq!(kb_to_mb(2560), 2.5);
+    }
+
+    #[test]
+    fn memory_v2_matches_nvml_h() {
+        // nvml.h: #define nvmlMemory_v2 NVML_STRUCT_VERSION(Memory, 2), with
+        // unsigned int version padded to 8 ahead of four unsigned long longs.
+        assert_eq!(std::mem::size_of::<NvmlMemoryV2>(), 40);
+        assert_eq!(NVML_MEMORY_V2, 0x0200_0028);
     }
 
     #[test]

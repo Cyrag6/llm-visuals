@@ -169,3 +169,13 @@
 - **Root cause:** `collect_pcie_throughput` looped `0..count` with two `nvmlDeviceGetPcieThroughput` calls per device; the driver samples that counter over ~20ms per call, so an 8-GPU host spent ~320ms inside a 400ms host poll and jittered the `dt` that `perf::observe_host` divides rates by.
 - **Fix applied:** `collect_pcie_throughput(&self, filter: &[usize])`, threaded from `args.gpu_indices()` through `HostMonitor::new`.
 - **Prevention rule:** Push the display filter down to the collector whenever a per-item query blocks; pass it as a parameter rather than filtering the result.
+
+### NVML VRAM used included the driver's reserved carve-out — 2026-09-23
+
+- **Severity:** Medium
+- **Category:** API Misuse
+- **File(s):** `src/nvml.rs`
+- **Pattern:** Same as the power-limit entry: a second backend reading a counter with the same name but different semantics.
+- **Root cause:** `nvmlDeviceGetMemoryInfo` (v1) folds the driver's reserved memory into `used`; `nvidia-smi`'s `memory.used` comes from the v2 struct, which reports `reserved` separately. On an idle RTX 5060 Ti NVML said 494 MB used against `nvidia-smi`'s 33 MB (RTX 3070: 364 vs 15), which leaks into the VRAM gauge and the weights/KV split. `bytes_to_mb` also truncated where `nvidia-smi` rounds, reading 1 MB low.
+- **Fix applied:** Prefer `nvmlDeviceGetMemoryInfo_v2` (R510+) with `version = NVML_STRUCT_VERSION(Memory, 2)`, falling back to v1. Round to the nearest MiB. Verified on hardware: both backends now agree to within 1 MB on every field.
+- **Prevention rule:** Verify a new backend against the old one on real hardware, field by field, before relying on "matching" names.

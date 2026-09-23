@@ -100,6 +100,26 @@
 - **Fix applied:** Assert the explicit endpoint is present (and error text for failures) without requiring it to be the only detected model.
 - **Prevention rule:** Tests that call `discover()` must select the model under test by port/name; never assert the whole result set is empty or length 1 unless process scanning is stubbed.
 
+### Missing counter treated as a real zero — 2026-09-22
+
+- **Severity:** High
+- **Category:** Logic
+- **File(s):** `src/observe.rs`, `src/main.rs`
+- **Pattern:** `unwrap_or(0)` on a JSON field that an upstream server may omit, so "not reported" and "reported as zero" become the same value and no fallback can tell them apart.
+- **Root cause:** Recent llama.cpp dev builds leave `n_decoded` out of `/slots` during generation. The parser stored 0, the rate window saw no delta, and finished requests never accumulated decode tokens.
+- **Fix applied:** `decoded_present` records whether the field was a number. When it was not, the poller fills `decoded` from a per-request anchor on `tokens_predicted_total`.
+- **Prevention rule:** When a sampled counter is optional, store presence separately from the value. Do not use `unwrap_or(0)` on it if zero is also a meaningful sample.
+
+### Poll target hardcoded to loopback — 2026-09-22
+
+- **Severity:** High
+- **Category:** Logic
+- **File(s):** `src/main.rs`, `src/model_detect.rs`, `src/observe.rs`, `src/sglang.rs`, `src/vllm.rs`
+- **Pattern:** A detector records a server's listen address and every poller then dials a hardcoded `127.0.0.1` instead.
+- **Root cause:** `--host <lan-ip>` was parsed nowhere, so a server that does not bind loopback was listed from the process table and then polled at an address that refuses the connection.
+- **Fix applied:** `DetectedModel.host` comes from `--host`. Wildcard binds (`0.0.0.0`, `::`, empty) still dial `127.0.0.1`. The local port probe also tries a few non-loopback addresses from the machine's own fib_trie.
+- **Prevention rule:** Any new poll or probe takes the detected host. A wildcard listen address must be dialed as loopback; a concrete address must be dialed as itself. Add a cmdline test for both.
+
 ### NVML device dropped when one optional query returns NOT_SUPPORTED — 2026-09-23
 
 - **Severity:** High

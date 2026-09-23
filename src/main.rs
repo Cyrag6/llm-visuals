@@ -161,7 +161,10 @@ async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<S
         if model.engine == "llama.cpp" && model.gguf.is_none() {
             if let Some(port) = model.port {
                 let auth = auth_for(model, auth);
-                probes.spawn(async move { (index, observe::poll_llama_props(port, &auth).await) });
+                let host = model.host.clone();
+                probes.spawn(async move {
+                    (index, observe::poll_llama_props(&host, port, &auth).await)
+                });
             }
         }
     }
@@ -236,7 +239,7 @@ async fn poll_server(
         // fetched once at attach. Each poll is a line in SGLang's access
         // log, so we never go faster than 400 ms.
         let mut adapter = sglang::SglangAdapter::new();
-        let mut info = sglang::poll_server_info(port, &auth).await;
+        let mut info = sglang::poll_server_info(&model.host, port, &auth).await;
         let mut metrics_ok = true;
         let mut metrics_misses = 0u32;
         let mut misses = 0u32;
@@ -255,10 +258,10 @@ async fn poll_server(
             .unwrap_or(0);
         loop {
             if info.is_none() {
-                info = sglang::poll_server_info(port, &auth).await;
+                info = sglang::poll_server_info(&model.host, port, &auth).await;
             }
             let metrics = if metrics_ok {
-                match sglang::poll_sglang_metrics(port, &auth).await {
+                match sglang::poll_sglang_metrics(&model.host, port, &auth).await {
                     Some(m) => Some(m),
                     None => {
                         metrics_misses += 1;
@@ -271,7 +274,7 @@ async fn poll_server(
             } else {
                 None
             };
-            if let Some(c) = sglang::poll_loads(port, &auth).await {
+            if let Some(c) = sglang::poll_loads(&model.host, port, &auth).await {
                 misses = 0;
                 let (mut stats, spec_pair) = adapter.observe(&c, metrics.as_ref());
                 stats.ctx_max = info
@@ -327,7 +330,7 @@ async fn poll_server(
         let mut adapter = vllm::VllmAdapter::new();
         let mut misses = 0u32;
         loop {
-            if let Some(c) = vllm::poll_vllm(port, &model.name, &others, &auth).await {
+            if let Some(c) = vllm::poll_vllm(&model.host, port, &model.name, &others, &auth).await {
                 misses = 0;
                 let (mut stats, spec) = adapter.observe(&c);
                 stats.ctx_max = model.ctx_max.unwrap_or(0);
@@ -369,15 +372,19 @@ async fn poll_server(
     let mut metrics_misses = 0u32;
     let mut experts_ok = true;
     let mut experts_misses = 0u32;
+    let mut decode_fallback = observe::DecodeFallback::default();
+    let host = model.host.clone();
     loop {
-        if let Some(stats) = observe::poll_llama(port, &auth).await {
-            let _ = live_tx.try_send((pid, stats));
-        }
+        let mut stats_opt = observe::poll_llama(&host, port, &auth).await;
         // Draft/MTP counters live on /metrics; skip once we know this server
-        // was started without --metrics.
+        // was started without --metrics. The same scrape fills decode when
+        // /slots left `n_decoded` out.
         if metrics_ok {
-            match observe::poll_metrics(port, &auth).await {
+            match observe::poll_metrics(&host, port, &auth).await {
                 Some(m) => {
+                    if let Some(stats) = stats_opt.as_mut() {
+                        decode_fallback.apply(stats, m.tokens_predicted);
+                    }
                     let _ = spec_tx.try_send((pid, m));
                 }
                 None => metrics_misses += 1,
@@ -386,9 +393,12 @@ async fn poll_server(
                 metrics_ok = false;
             }
         }
+        if let Some(stats) = stats_opt {
+            let _ = live_tx.try_send((pid, stats));
+        }
         // Real MoE routing needs the patched server (--expert-stats).
         if experts_ok {
-            match observe::poll_experts(port, &auth).await {
+            match observe::poll_experts(&host, port, &auth).await {
                 Some(e) => {
                     let _ = experts_tx.try_send((pid, e));
                 }

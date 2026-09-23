@@ -404,7 +404,7 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 
 | Metric | Source |
 |---|---|
-| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. 1 s sliding window |
+| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. When that field is absent, delta of `llamacpp:tokens_predicted_total` from `GET /metrics`, anchored at the start of the request. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. 1 s sliding window. Polls go to the server's `--host` (loopback when it bound `0.0.0.0`) |
 | prefill tok/s | llama.cpp: `n_prompt_tokens_processed`. vLLM: prompt-token counter. SGLang: `total_prefill_uncached_tokens`, or `sglang:realtime_tokens_total{mode="prefill_compute"}` with `--enable-metrics` |
 | time to first token | slot turning busy → first decoded token, quantised to the poll interval |
 | tok/J | decode tok/s ÷ summed GPU power draw |

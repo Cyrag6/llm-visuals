@@ -148,6 +148,7 @@ fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
         engine: "llama.cpp".into(),
         gpu_indices: p.gpus.to_vec(),
         mem_used_mb: p.mem_used_mb,
+        host: "127.0.0.1".into(),
         port: Some(8080 + idx as u16),
         ctx_max: Some(ctx),
         spec_type: if p.n_mtp > 0 {

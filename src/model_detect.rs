@@ -108,23 +108,19 @@ impl DetectedModel {
 
     /// GGUF metadata, else HF config.json topology for safetensors dirs.
     pub fn n_layers(&self) -> usize {
-        self.gguf.as_ref().map(|g| g.n_layers)
-            .unwrap_or(0)
+        self.gguf.as_ref().map(|g| g.n_layers).unwrap_or(0)
     }
 
     pub fn n_heads(&self) -> usize {
-        self.gguf.as_ref().map(|g| g.n_heads)
-            .unwrap_or(0)
+        self.gguf.as_ref().map(|g| g.n_heads).unwrap_or(0)
     }
 
     pub fn n_experts(&self) -> usize {
-        self.gguf.as_ref().map(|g| g.n_experts)
-            .unwrap_or(0)
+        self.gguf.as_ref().map(|g| g.n_experts).unwrap_or(0)
     }
 
     pub fn n_experts_used(&self) -> usize {
-        self.gguf.as_ref().map(|g| g.n_experts_used)
-            .unwrap_or(0)
+        self.gguf.as_ref().map(|g| g.n_experts_used).unwrap_or(0)
     }
 }
 

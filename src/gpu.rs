@@ -698,7 +698,9 @@ mod live_tests {
     #[test]
     #[ignore = "live check: run on a host with real GPUs"]
     fn collects_live_gpu_stats() {
-        let stats = GpuBackend::detect().collect().expect("gpu monitor returned an error");
+        let stats = GpuBackend::detect()
+            .collect()
+            .expect("gpu monitor returned an error");
         for g in &stats {
             eprintln!(
                 "gpu: idx={} name='{}' vram={}/{}MB util_gpu={} util_mem={} {}W/{}W temp={:?} clk={}/{}MHz",

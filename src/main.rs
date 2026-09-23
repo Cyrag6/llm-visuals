@@ -1126,8 +1126,16 @@ mod tests {
     fn dir_model_bytes_sums_weight_shards_only() {
         let dir = std::env::temp_dir().join("llm-visuals-test-dirmodel");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("model-00001-of-00002.safetensors"), vec![0u8; 3000]).unwrap();
-        std::fs::write(dir.join("model-00002-of-00002.safetensors"), vec![0u8; 2000]).unwrap();
+        std::fs::write(
+            dir.join("model-00001-of-00002.safetensors"),
+            vec![0u8; 3000],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("model-00002-of-00002.safetensors"),
+            vec![0u8; 2000],
+        )
+        .unwrap();
         // Non-weight files must not count.
         std::fs::write(dir.join("config.json"), "{}").unwrap();
         std::fs::write(dir.join("SHA256SUMS.local"), b"xx").unwrap();
@@ -1143,7 +1151,10 @@ mod tests {
         assert_eq!(dir_model_bytes(&empty), None);
 
         // Missing dir → None.
-        assert_eq!(dir_model_bytes(&PathBuf::from("/nonexistent-llm-visuals")), None);
+        assert_eq!(
+            dir_model_bytes(&PathBuf::from("/nonexistent-llm-visuals")),
+            None
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&empty).ok();

@@ -154,6 +154,7 @@ mod os {
 
 pub struct NvmlSession {
     _lib: os::Library,
+    init_fn: FnNvmlInit,
     shutdown_fn: FnNvmlShutdown,
     device_get_count_fn: FnNvmlDeviceGetCount,
     device_get_handle_by_index_fn: FnNvmlDeviceGetHandleByIndex,
@@ -247,15 +248,18 @@ impl NvmlSession {
         let device_get_power_usage_fn: FnNvmlDeviceGetPowerUsage =
             sym!(lib, b"nvmlDeviceGetPowerUsage\0", FnNvmlDeviceGetPowerUsage);
 
+        // Management limit first: it is what nvidia-smi's `power.limit` reports, so the
+        // power gauge reads the same with and without --no-nvml. (The enforced limit is
+        // `enforced.power.limit` there, and is lower on a thermally capped card.)
         let device_get_power_limit_fn = opt_sym!(
             lib,
-            b"nvmlDeviceGetEnforcedPowerLimit\0",
+            b"nvmlDeviceGetPowerManagementLimit\0",
             FnNvmlDeviceGetPowerLimit
         )
         .or_else(|| {
             opt_sym!(
                 lib,
-                b"nvmlDeviceGetPowerManagementLimit\0",
+                b"nvmlDeviceGetEnforcedPowerLimit\0",
                 FnNvmlDeviceGetPowerLimit
             )
         });
@@ -296,6 +300,7 @@ impl NvmlSession {
 
         Some(Arc::new(Self {
             _lib: lib,
+            init_fn,
             shutdown_fn,
             device_get_count_fn,
             device_get_handle_by_index_fn,
@@ -315,13 +320,35 @@ impl NvmlSession {
         }))
     }
 
-    /// Query stats for all NVIDIA GPUs currently online.
-    pub fn collect_stats(&self) -> Result<Vec<GpuStats>, String> {
+    /// Re-establish the driver session. A driver reload, package upgrade or GPU reset
+    /// invalidates it permanently (every call then returns UNINITIALIZED / GPU_IS_LOST),
+    /// where the nvidia-smi fallback recovered by itself on the next poll. Device handles
+    /// are re-fetched by index every poll, so nothing outlives this.
+    fn reinit(&self) -> bool {
+        if self.initialized.swap(false, Ordering::SeqCst) {
+            unsafe { (self.shutdown_fn)() };
+        }
+        let ok = unsafe { (self.init_fn)() } == NVML_SUCCESS;
+        self.initialized.store(ok, Ordering::SeqCst);
+        ok
+    }
+
+    /// Device count, retrying once through `reinit` so telemetry self-heals.
+    fn device_count(&self) -> Result<u32, String> {
         let mut count = 0u32;
-        let res = unsafe { (self.device_get_count_fn)(&mut count) };
+        let mut res = unsafe { (self.device_get_count_fn)(&mut count) };
+        if res != NVML_SUCCESS && self.reinit() {
+            res = unsafe { (self.device_get_count_fn)(&mut count) };
+        }
         if res != NVML_SUCCESS {
             return Err(format!("nvmlDeviceGetCount failed: {res}"));
         }
+        Ok(count)
+    }
+
+    /// Query stats for all NVIDIA GPUs currently online.
+    pub fn collect_stats(&self) -> Result<Vec<GpuStats>, String> {
+        let count = self.device_count()?;
 
         let mut stats_list = Vec::with_capacity(count as usize);
 
@@ -348,22 +375,22 @@ impl NvmlSession {
                 format!("GPU {index}")
             };
 
-            // Memory (require successful query and non-zero total VRAM)
+            // Memory and utilization are best-effort like every other field below: a
+            // device that cannot answer one of them (NOT_SUPPORTED on MIG, for one)
+            // keeps its row with zeros, the way nvidia-smi printed [N/A]. Dropping it
+            // instead would silently shrink the panel and understate summed watts.
             let mut mem = NvmlMemory::default();
-            if unsafe { (self.device_get_memory_info_fn)(handle, &mut mem) } != NVML_SUCCESS
-                || mem.total == 0
-            {
-                continue;
+            if unsafe { (self.device_get_memory_info_fn)(handle, &mut mem) } != NVML_SUCCESS {
+                mem = NvmlMemory::default();
             }
             let mem_total_mb = bytes_to_mb(mem.total);
             let mem_used_mb = bytes_to_mb(mem.used);
             let mem_free_mb = bytes_to_mb(mem.free);
 
-            // Utilization
             let mut util = NvmlUtilization::default();
             if unsafe { (self.device_get_utilization_rates_fn)(handle, &mut util) } != NVML_SUCCESS
             {
-                continue;
+                util = NvmlUtilization::default();
             }
 
             // Temperature
@@ -457,7 +484,9 @@ impl NvmlSession {
             });
         }
 
-        if stats_list.is_empty() && count > 0 {
+        // Every device unreadable means NVML is not a usable backend here; the Err lets
+        // GpuBackend::detect fall through to nvidia-smi. Same test collect_amd applies.
+        if count > 0 && stats_list.iter().all(|gpu| gpu.mem_total_mb == 0) {
             return Err(format!(
                 "NVML reported {count} device(s), but failed to query readable telemetry"
             ));
@@ -466,17 +495,19 @@ impl NvmlSession {
         Ok(stats_list)
     }
 
-    /// Query PCIe throughput (rx_mb_s, tx_mb_s) for each GPU.
-    pub fn collect_pcie_throughput(&self) -> Option<Vec<(u32, f32, f32)>> {
+    /// Query PCIe throughput (rx_mb_s, tx_mb_s) per GPU. `filter` empty means all;
+    /// otherwise only those `index` values. The driver samples the counter over ~20ms
+    /// per call and there are two calls per device, so on a many-GPU host polling the
+    /// ones the panel never shows would eat most of the host-poll interval.
+    pub fn collect_pcie_throughput(&self, filter: &[usize]) -> Option<Vec<(u32, f32, f32)>> {
         let throughput_fn = self.device_get_pcie_throughput_fn?;
-        let mut count = 0u32;
-        let res = unsafe { (self.device_get_count_fn)(&mut count) };
-        if res != NVML_SUCCESS || count == 0 {
+        let count = self.device_count().ok()?;
+        if count == 0 {
             return None;
         }
 
         let mut rows = Vec::with_capacity(count as usize);
-        for index in 0..count {
+        for index in (0..count).filter(|i| filter.is_empty() || filter.contains(&(*i as usize))) {
             let mut handle: *mut c_void = std::ptr::null_mut();
             let res = unsafe { (self.device_get_handle_by_index_fn)(index, &mut handle) };
             if res != NVML_SUCCESS || handle.is_null() {
@@ -553,27 +584,37 @@ mod tests {
 
     #[test]
     fn test_nvml_lifecycle_and_stats() {
-        if let Some(session) = NvmlSession::new() {
-            let stats = session.collect_stats().expect("stats collection");
-            assert!(!stats.is_empty());
-            let gpu0 = &stats[0];
-            assert!(gpu0.mem_total_mb > 0);
-            println!(
-                "Detected GPU: {} with {} MB total VRAM",
-                gpu0.name, gpu0.mem_total_mb
-            );
-
-            // Test PCIe throughput
-            let pcie = session.collect_pcie_throughput();
-            if let Some(rows) = pcie {
-                assert!(!rows.is_empty());
-                println!(
-                    "PCIe throughput: GPU 0 RX: {:.2} MB/s, TX: {:.2} MB/s",
-                    rows[0].1, rows[0].2
-                );
-            }
-        } else {
+        // Every case GpuBackend::detect treats as "fall back to nvidia-smi" is a skip
+        // here, not a failure: no driver, a container with the library but no devices
+        // passed through, or devices whose telemetry is unreadable (all-MIG host).
+        let Some(session) = NvmlSession::new() else {
             println!("NVML not available on this machine (skipping test)");
+            return;
+        };
+        let Ok(stats) = session.collect_stats() else {
+            println!("NVML reports no readable telemetry (skipping test)");
+            return;
+        };
+        let Some(gpu0) = stats.first() else {
+            println!("NVML loaded but no devices visible (skipping test)");
+            return;
+        };
+        // Ok implies at least one device answered; individual rows may be zeroed.
+        assert!(
+            stats.iter().any(|gpu| gpu.mem_total_mb > 0),
+            "collect_stats returned Ok with no readable device"
+        );
+        println!(
+            "Detected GPU: {} with {} MB total VRAM",
+            gpu0.name, gpu0.mem_total_mb
+        );
+
+        if let Some(rows) = session.collect_pcie_throughput(&[]) {
+            assert!(!rows.is_empty());
+            println!(
+                "PCIe throughput: GPU 0 RX: {:.2} MB/s, TX: {:.2} MB/s",
+                rows[0].1, rows[0].2
+            );
         }
     }
 }

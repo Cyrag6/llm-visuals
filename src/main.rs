@@ -581,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poll,
             &auth,
         );
+        let host_gpu_filter = gpu_filter.clone();
         let gpu_backend_poll = Arc::clone(gpu_backend.as_ref().unwrap());
         tokio::spawn(async move {
             GpuMonitor::new(gpu_backend_poll)
@@ -589,9 +590,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         tokio::spawn(async move {
             // Host counters at half the GPU polling rate are plenty.
-            HostMonitor::new(poll.max(Duration::from_millis(400)), nvml_host)
-                .run(host_tx, pids_rx)
-                .await;
+            HostMonitor::new(
+                poll.max(Duration::from_millis(400)),
+                nvml_host,
+                host_gpu_filter,
+            )
+            .run(host_tx, pids_rx)
+            .await;
         });
     }
 

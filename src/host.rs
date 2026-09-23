@@ -34,11 +34,17 @@ pub struct HostSample {
 pub struct HostMonitor {
     interval: Duration,
     nvml: Option<Arc<NvmlSession>>,
+    /// GPU indices the panel shows; empty means all. Only the NVML PCIe path uses it.
+    gpu_filter: Vec<usize>,
 }
 
 impl HostMonitor {
-    pub fn new(interval: Duration, nvml: Option<Arc<NvmlSession>>) -> Self {
-        Self { interval, nvml }
+    pub fn new(interval: Duration, nvml: Option<Arc<NvmlSession>>, gpu_filter: Vec<usize>) -> Self {
+        Self {
+            interval,
+            nvml,
+            gpu_filter,
+        }
     }
 
     /// Poll until the receiver goes away. `pids_rx` follows the detected
@@ -54,6 +60,7 @@ impl HostMonitor {
         let mut pcie_ok = true;
         let mut pcie_misses = 0u32;
         let nvml = self.nvml;
+        let gpu_filter = self.gpu_filter;
         #[cfg(not(target_os = "linux"))]
         let mut sys = sysinfo::System::new();
 
@@ -61,17 +68,25 @@ impl HostMonitor {
             let pids = pids_rx.borrow_and_update().clone();
             let want_pcie = pcie_ok;
             let nvml_ref = nvml.clone();
+            let filter_ref = gpu_filter.clone();
 
             #[cfg(target_os = "linux")]
-            let sample =
-                tokio::task::spawn_blocking(move || collect(&pids, want_pcie, nvml_ref.as_deref()))
-                    .await;
+            let sample = tokio::task::spawn_blocking(move || {
+                collect(&pids, want_pcie, nvml_ref.as_deref(), &filter_ref)
+            })
+            .await;
 
             #[cfg(not(target_os = "linux"))]
             let (sample, returned_sys) = {
                 let mut current_sys = sys;
                 let res = tokio::task::spawn_blocking(move || {
-                    let s = collect(&pids, want_pcie, nvml_ref.as_deref(), &mut current_sys);
+                    let s = collect(
+                        &pids,
+                        want_pcie,
+                        nvml_ref.as_deref(),
+                        &filter_ref,
+                        &mut current_sys,
+                    );
                     (s, current_sys)
                 })
                 .await;
@@ -120,12 +135,17 @@ impl HostMonitor {
 }
 
 #[cfg(target_os = "linux")]
-fn collect(pids: &[u32], want_pcie: bool, nvml: Option<&NvmlSession>) -> Vec<(u32, HostSample)> {
+fn collect(
+    pids: &[u32],
+    want_pcie: bool,
+    nvml: Option<&NvmlSession>,
+    gpu_filter: &[usize],
+) -> Vec<(u32, HostSample)> {
     let mut base = HostSample::default();
     read_system(&mut base);
     if want_pcie {
         if let Some(p) = nvml
-            .and_then(|n| n.collect_pcie_throughput())
+            .and_then(|n| n.collect_pcie_throughput(gpu_filter))
             .or_else(pcie_throughput)
         {
             base.pcie_mb_s = p;
@@ -149,13 +169,14 @@ fn collect(
     pids: &[u32],
     want_pcie: bool,
     nvml: Option<&NvmlSession>,
+    gpu_filter: &[usize],
     sys: &mut sysinfo::System,
 ) -> Vec<(u32, HostSample)> {
     let mut base = HostSample::default();
     read_system(&mut base, sys);
     if want_pcie {
         if let Some(p) = nvml
-            .and_then(|n| n.collect_pcie_throughput())
+            .and_then(|n| n.collect_pcie_throughput(gpu_filter))
             .or_else(pcie_throughput)
         {
             base.pcie_mb_s = p;

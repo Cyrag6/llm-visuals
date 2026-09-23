@@ -119,3 +119,63 @@
 - **Root cause:** `--host <lan-ip>` was parsed nowhere, so a server that does not bind loopback was listed from the process table and then polled at an address that refuses the connection.
 - **Fix applied:** `DetectedModel.host` comes from `--host`. Wildcard binds (`0.0.0.0`, `::`, empty) still dial `127.0.0.1`. The local port probe also tries a few non-loopback addresses from the machine's own fib_trie.
 - **Prevention rule:** Any new poll or probe takes the detected host. A wildcard listen address must be dialed as loopback; a concrete address must be dialed as itself. Add a cmdline test for both.
+
+### NVML device dropped when one optional query returns NOT_SUPPORTED — 2026-09-23
+
+- **Severity:** High
+- **Category:** Logic
+- **File(s):** `src/nvml.rs`
+- **Pattern:** `continue`-ing past a whole device/record when one *informational* field of a driver or CLI query fails, so the entity silently disappears from an aggregate. Recurrence of the 2026-09-17 `[N/A]` entry in a different API (FFI instead of CSV).
+- **Root cause:** `collect_stats` skipped the device when `nvmlDeviceGetMemoryInfo` or `nvmlDeviceGetUtilizationRates` was not `NVML_SUCCESS`; both return `NVML_ERROR_NOT_SUPPORTED` on MIG-enabled devices. The panel showed one fewer GPU and `total_power_w` (and the `tok/J` derived from it) were understated with no error.
+- **Fix applied:** Both fields default to zero like every other optional field; the fallback signal moved to "no device reported non-zero VRAM", matching `collect_amd`.
+- **Prevention rule:** Only drop a device/record when its *identity* lookup fails (handle, index, pid). Default every telemetry field; signal an unusable backend from an all-devices-unreadable test, never by shrinking the list.
+
+### Stateful NVML session cached for process lifetime could not self-heal — 2026-09-23
+
+- **Severity:** High
+- **Category:** API Misuse
+- **File(s):** `src/gpu.rs`, `src/nvml.rs`
+- **Pattern:** Replacing a stateless per-poll collector (subprocess, HTTP request) with a long-lived stateful session probed once at startup, without a recovery path. The old design recovered from external restarts for free; the new one wedges permanently.
+- **Root cause:** `GpuBackend::detect` ran once and the `Arc<NvmlSession>` was reused forever. After a driver reload, package upgrade, GPU reset or Xid, NVML returns `UNINITIALIZED`/`GPU_IS_LOST` on every subsequent call, where the `nvidia-smi` path it replaced simply worked again on the next poll.
+- **Fix applied:** `NvmlSession::reinit` (shutdown + `nvmlInit_v2`), retried once from `device_count()`. Handles are already re-fetched by index each poll, and both `gpu.rs` and `host.rs` share the `Arc`, so both consumers recover.
+- **Prevention rule:** When swapping a per-call collector for a persistent session, ask what happens when the far side restarts — and re-establish the session on the first error rather than caching failure.
+
+### Hardware test asserted on conditions production treats as fallback — 2026-09-23
+
+- **Severity:** Medium
+- **Category:** Convention
+- **File(s):** `src/nvml.rs`
+- **Pattern:** A hardware-gated test whose skip guard is narrower than production's fallback condition, so it fails on machines the product handles correctly.
+- **Root cause:** `test_nvml_lifecycle_and_stats` skipped only when `NvmlSession::new()` returned `None`, then `.expect()`ed stats and asserted non-empty. A container with `libnvidia-ml.so.1` but no `/dev/nvidia*` (count 0) or an all-MIG host (`Err`) both panic, while `GpuBackend::detect` correctly falls through to `nvidia-smi`.
+- **Fix applied:** Every condition that makes production fall back — `None`, `Err`, zero devices — is now a `println!` + `return`.
+- **Prevention rule:** A hardware test's skip guard must cover exactly the set of states the production fallback tolerates. Enumerate them from the production branch, not from the dev machine.
+
+### NVML power limit not the same quantity as nvidia-smi power.limit — 2026-09-23
+
+- **Severity:** Low
+- **Category:** API Misuse
+- **File(s):** `src/nvml.rs`
+- **Pattern:** Two backends for the same displayed metric reading different underlying quantities, so a gauge's meaning changes with a `--flag` that is meant to be transparent.
+- **Root cause:** The NVML path preferred `nvmlDeviceGetEnforcedPowerLimit` while the CSV path parses `power.limit`, which is the *management* limit (`nvidia-smi` exposes the enforced one separately as `enforced.power.limit`). On a thermally capped card the two differ, so `power_frac()`'s full scale differed with and without `--no-nvml`.
+- **Fix applied:** Prefer `nvmlDeviceGetPowerManagementLimit`, falling back to the enforced limit only if the symbol is missing.
+- **Prevention rule:** When adding a second backend for an existing metric, map each field to the *exact* counter the original used — matching names are not matching semantics.
+
+### Sampled per-device driver calls issued for GPUs the panel filters out — 2026-09-23
+
+- **Severity:** Low
+- **Category:** Other
+- **File(s):** `src/nvml.rs`, `src/host.rs`, `src/main.rs`
+- **Pattern:** A collector iterating every device when a display filter (`--gpu`) already narrows what is shown, where each call has a fixed driver-side sampling cost.
+- **Root cause:** `collect_pcie_throughput` looped `0..count` with two `nvmlDeviceGetPcieThroughput` calls per device; the driver samples that counter over ~20ms per call, so an 8-GPU host spent ~320ms inside a 400ms host poll and jittered the `dt` that `perf::observe_host` divides rates by.
+- **Fix applied:** `collect_pcie_throughput(&self, filter: &[usize])`, threaded from `args.gpu_indices()` through `HostMonitor::new`.
+- **Prevention rule:** Push the display filter down to the collector whenever a per-item query blocks; pass it as a parameter rather than filtering the result.
+
+### NVML VRAM used included the driver's reserved carve-out — 2026-09-23
+
+- **Severity:** Medium
+- **Category:** API Misuse
+- **File(s):** `src/nvml.rs`
+- **Pattern:** Same as the power-limit entry: a second backend reading a counter with the same name but different semantics.
+- **Root cause:** `nvmlDeviceGetMemoryInfo` (v1) folds the driver's reserved memory into `used`; `nvidia-smi`'s `memory.used` comes from the v2 struct, which reports `reserved` separately. On an idle RTX 5060 Ti NVML said 494 MB used against `nvidia-smi`'s 33 MB (RTX 3070: 364 vs 15), which leaks into the VRAM gauge and the weights/KV split. `bytes_to_mb` also truncated where `nvidia-smi` rounds, reading 1 MB low.
+- **Fix applied:** Prefer `nvmlDeviceGetMemoryInfo_v2` (R510+) with `version = NVML_STRUCT_VERSION(Memory, 2)`, falling back to v1. Round to the nearest MiB. Verified on hardware: both backends now agree to within 1 MB on every field.
+- **Prevention rule:** Verify a new backend against the old one on real hardware, field by field, before relying on "matching" names.

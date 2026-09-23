@@ -64,6 +64,8 @@ pub struct Dashboard<'a> {
     pub demo: bool,
     /// Real routing from the patched server, when available.
     pub experts: Option<&'a ExpertStats>,
+    /// GPU telemetry backend: "nvml", "smi", "xpu", "amd", or "demo".
+    pub gpu_backend: Option<&'a str>,
     /// The settings screen, drawn over the view while it is open.
     pub settings: Option<&'a SettingsForm>,
 }
@@ -574,10 +576,14 @@ impl Renderer {
     // -----------------------------------------------------------------------
 
     fn render_gpus(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let tag = match d.gpu_backend {
+            Some(backend) if !backend.is_empty() => format!(" · {backend}"),
+            _ => String::new(),
+        };
         let title = if d.gpus.len() > 1 {
-            format!(" ◆ GPUS  {} devices ", d.gpus.len())
+            format!(" ◆ GPUS  {} devices{} ", d.gpus.len(), tag)
         } else {
-            " ◆ GPU ".to_string()
+            format!(" ◆ GPU{} ", tag)
         };
         let total_w: f32 = d.gpus.iter().map(|g| g.power_watts).sum();
         let right = Line::from(Span::styled(

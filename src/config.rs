@@ -100,6 +100,10 @@ pub struct Args {
     #[arg(long, default_value = "all")]
     pub gpu: String,
 
+    /// Force nvidia-smi CLI fallback instead of native in-process NVML driver telemetry
+    #[arg(long)]
+    pub no_nvml: bool,
+
     /// Number of MoE experts per layer (for demo)
     #[arg(long, default_value_t = 4)]
     pub moe_experts: usize,

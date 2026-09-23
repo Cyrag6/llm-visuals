@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 
+use crate::nvml::NvmlSession;
+
 /// Statistics for a single GPU
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
@@ -76,30 +78,31 @@ impl GpuStats {
 /// One poll: the stats, or the reason no supported GPU backend produced data.
 pub type GpuSample = Result<Vec<GpuStats>, String>;
 
-/// Collects GPU stats from nvidia-smi or Linux amdgpu sysfs every 200ms.
+/// Collects GPU stats from in-process NVML, nvidia-smi, or Linux amdgpu sysfs every 200ms.
 pub struct GpuMonitor {
     interval: Duration,
     backend: Arc<GpuBackend>,
 }
 
-enum GpuBackend {
-    Nvidia,
+pub enum GpuBackend {
+    Nvml(Arc<NvmlSession>),
+    NvidiaSmi,
     Amd(Vec<AmdDevice>),
 }
 
-struct AmdDevice {
-    path: PathBuf,
-    hwmon: Option<PathBuf>,
-    name: String,
+pub struct AmdDevice {
+    pub path: PathBuf,
+    pub hwmon: Option<PathBuf>,
+    pub name: String,
 }
 
 const QUERY: &str = "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,clocks.sm,clocks.max.sm,clocks.mem,fan.speed,pcie.link.gen.current,pcie.link.width.current";
 
 impl GpuMonitor {
-    pub fn new() -> Self {
+    pub fn new(backend: Arc<GpuBackend>) -> Self {
         Self {
             interval: Duration::from_millis(200),
-            backend: Arc::new(GpuBackend::detect()),
+            backend,
         }
     }
 
@@ -121,8 +124,8 @@ impl GpuMonitor {
         }
     }
 
-    /// Parse nvidia-smi CSV output into GpuStats.
-    fn collect_nvidia() -> Result<Vec<GpuStats>, String> {
+    /// Parse nvidia-smi CSV output into GpuStats (fallback if NVML is not available).
+    pub fn collect_nvidia() -> Result<Vec<GpuStats>, String> {
         let output = std::process::Command::new("nvidia-smi")
             .args([QUERY, "--format=csv,noheader,nounits"])
             .output()
@@ -148,29 +151,43 @@ impl GpuMonitor {
     }
 
     /// Single-shot collect for initial stats.
-    pub fn collect_once() -> Result<Vec<GpuStats>, String> {
-        GpuBackend::detect().collect()
+    pub fn collect_once(backend: &GpuBackend) -> Result<Vec<GpuStats>, String> {
+        backend.collect()
     }
 }
 
 impl GpuBackend {
-    fn detect() -> Self {
+    pub fn detect(nvml: Option<Arc<NvmlSession>>) -> Self {
+        if let Some(session) = nvml {
+            if session.collect_stats().is_ok_and(|gpus| !gpus.is_empty()) {
+                return Self::Nvml(session);
+            }
+        }
         if GpuMonitor::collect_nvidia().is_ok_and(|gpus| !gpus.is_empty()) {
-            Self::Nvidia
+            Self::NvidiaSmi
         } else {
             let devices = amd_devices();
             if devices.is_empty() {
                 // Preserve nvidia-smi's useful error when neither backend exists.
-                Self::Nvidia
+                Self::NvidiaSmi
             } else {
                 Self::Amd(devices)
             }
         }
     }
 
-    fn collect(&self) -> Result<Vec<GpuStats>, String> {
+    pub fn name(&self) -> &'static str {
         match self {
-            Self::Nvidia => GpuMonitor::collect_nvidia(),
+            Self::Nvml(_) => "nvml",
+            Self::NvidiaSmi => "smi",
+            Self::Amd(_) => "amd",
+        }
+    }
+
+    pub fn collect(&self) -> Result<Vec<GpuStats>, String> {
+        match self {
+            Self::Nvml(session) => session.collect_stats(),
+            Self::NvidiaSmi => GpuMonitor::collect_nvidia(),
             Self::Amd(devices) => collect_amd(devices),
         }
     }
@@ -216,6 +233,7 @@ fn amd_device_paths() -> Vec<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn amd_device_paths() -> Vec<PathBuf> {
     Vec::new()
 }

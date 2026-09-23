@@ -613,7 +613,10 @@ pub fn detect_models() -> Vec<DetectedModel> {
                         // on (needs the same uid or root).
                         let via_root =
                             PathBuf::from(format!("/proc/{}/root/{}", m.pid, path.display()));
-                        via_root.exists().then_some(via_root)
+                        (via_root.exists()).then(|| {
+                            m.path = Some(via_root.clone());
+                            via_root
+                        })
                     })
                     .or_else(|| resolve_local_model_dir(&path, &m.name))
                     .unwrap_or(path)

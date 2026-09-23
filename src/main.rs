@@ -972,6 +972,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Total bytes of the model weight files inside a served directory
+/// (`*.safetensors`, `*.gguf`, `*.bin`). Symlinks count at their target's
+/// size; unreadable entries are skipped.
+fn dir_model_bytes(dir: &std::path::Path) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_model = name.ends_with(".safetensors")
+            || name.ends_with(".gguf")
+            || (name.ends_with(".bin") && name.starts_with("pytorch_model"));
+        if !is_model {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                total += meta.len();
+                any = true;
+            }
+        }
+    }
+    any.then_some(total)
+}
+
 fn fade_sample_from_live(
     detected: Option<&DetectedModel>,
     gpu: &[GpuStats],
@@ -1021,10 +1045,17 @@ fn fade_sample_from_live(
         .weight_gb
         .map(|g| (g * 1024.0) as u64)
         .or_else(|| {
-            detected
-                .and_then(|d| d.path.as_ref())
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() / (1024 * 1024))
+            detected.and_then(|d| d.path.as_ref()).and_then(|p| {
+                // A GGUF checkpoint is a single file; a served HF model is a
+                // directory of shards. stat() on a directory returns the size
+                // of the directory entry (4096), which would zero the weights
+                // segment and blame everything on KV — sum the shards instead.
+                if p.is_dir() {
+                    dir_model_bytes(p).map(|b| b / (1024 * 1024))
+                } else {
+                    std::fs::metadata(p).ok().map(|m| m.len() / (1024 * 1024))
+                }
+            })
         })
         .or_else(|| detected.map(|d| d.mem_used_mb))
         .unwrap_or(0);
@@ -1088,7 +1119,35 @@ fn fade_sample_from_live(
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn dir_model_bytes_sums_weight_shards_only() {
+        let dir = std::env::temp_dir().join("llm-visuals-test-dirmodel");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), vec![0u8; 3000]).unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), vec![0u8; 2000]).unwrap();
+        // Non-weight files must not count.
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("SHA256SUMS.local"), b"xx").unwrap();
+        // A pytorch_model .bin counts; a random .bin does not.
+        std::fs::write(dir.join("pytorch_model.bin"), vec![0u8; 500]).unwrap();
+        std::fs::write(dir.join("notes.bin"), b"x").unwrap();
+        assert_eq!(dir_model_bytes(&dir), Some(5500));
+
+        // Empty dir (no weight files) → None so the mem_used fallback fires.
+        let empty = std::env::temp_dir().join("llm-visuals-test-dirmodel-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("config.json"), "{}").unwrap();
+        assert_eq!(dir_model_bytes(&empty), None);
+
+        // Missing dir → None.
+        assert_eq!(dir_model_bytes(&PathBuf::from("/nonexistent-llm-visuals")), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&empty).ok();
+    }
 
     const CANNED_VLLM_MODELS: &str = r#"{"object":"list","data":[{"id":"test-model","object":"model","created":1789774371,"owned_by":"vllm","max_model_len":4096}]}"#;
     const CANNED_OLLAMA_MODELS: &str = r#"{"object":"list","data":[{"id":"llama3:latest","object":"model","created":1789774371,"owned_by":"library"}]}"#;

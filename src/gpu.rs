@@ -78,7 +78,9 @@ impl GpuStats {
 /// One poll: the stats, or the reason no supported GPU backend produced data.
 pub type GpuSample = Result<Vec<GpuStats>, String>;
 
-/// Collects GPU stats from in-process NVML, nvidia-smi, or Linux amdgpu sysfs every 200ms.
+/// Collects GPU stats every 200ms from whichever backend is detected:
+/// in-process NVML or nvidia-smi (NVIDIA), xpu-smi (Intel), or Linux amdgpu
+/// sysfs (AMD).
 pub struct GpuMonitor {
     interval: Duration,
     backend: Arc<GpuBackend>,
@@ -87,6 +89,7 @@ pub struct GpuMonitor {
 pub enum GpuBackend {
     Nvml(Arc<NvmlSession>),
     NvidiaSmi,
+    Xpu,
     Amd(Vec<AmdDevice>),
 }
 
@@ -96,7 +99,13 @@ pub struct AmdDevice {
     pub name: String,
 }
 
-const QUERY: &str = "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,clocks.sm,clocks.max.sm,clocks.mem,fan.speed,pcie.link.gen.current,pcie.link.width.current";
+const NVIDIA_QUERY: &str = "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,clocks.sm,clocks.max.sm,clocks.mem,fan.speed,pcie.link.gen.current,pcie.link.width.current";
+
+/// xpu-smi spelling of the same fields, in the same order as
+/// parse_xpu_csv expects. `clocks.sm` does not exist there (use
+/// clocks.current.graphics); `clocks.max.mem`, fan and PCIe are missing or
+/// N/A on current Intel drivers and parse as 0/None.
+const XPU_QUERY: &str = "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,clocks.current.graphics,clocks.max.graphics,clocks.current.media,fan.speed,pcie.link.gen.current,pcie.link.width.current";
 
 impl GpuMonitor {
     pub fn new(backend: Arc<GpuBackend>) -> Self {
@@ -126,34 +135,58 @@ impl GpuMonitor {
 
     /// Parse nvidia-smi CSV output into GpuStats (fallback if NVML is not available).
     pub fn collect_nvidia() -> Result<Vec<GpuStats>, String> {
-        let output = std::process::Command::new("nvidia-smi")
-            .args([QUERY, "--format=csv,noheader,nounits"])
-            .output()
-            .map_err(|e| format!("Failed to run nvidia-smi: {e}"))?;
+        run_smi("nvidia-smi", NVIDIA_QUERY).map(|out| parse_csv(&out))
+    }
 
-        if !output.status.success() {
-            // First non-empty line of either stream is the human-readable reason
-            // ("Failed to initialize NVML: Driver/library version mismatch", ...).
-            let msg = [output.stderr.as_slice(), output.stdout.as_slice()]
-                .iter()
-                .flat_map(|b| {
-                    String::from_utf8_lossy(b)
-                        .lines()
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or_else(|| format!("nvidia-smi exited with {}", output.status));
-            return Err(msg);
-        }
-
-        Ok(parse_csv(&String::from_utf8_lossy(&output.stdout)))
+    /// Intel GPUs via xpu-smi, same field order as NVIDIA_QUERY.
+    fn collect_xpu() -> Result<Vec<GpuStats>, String> {
+        run_smi("xpu-smi", XPU_QUERY).map(|out| parse_xpu_csv(&out))
     }
 
     /// Single-shot collect for initial stats.
     pub fn collect_once(backend: &GpuBackend) -> Result<Vec<GpuStats>, String> {
         backend.collect()
     }
+}
+
+/// Run an nvidia-smi-compatible CLI with a `--query-gpu` field list and
+/// return its CSV, or the tool's own error line.
+fn run_smi(bin: &str, query: &str) -> Result<String, String> {
+    let output = std::process::Command::new(bin)
+        .args([query, "--format=csv,noheader,nounits"])
+        .output()
+        .map_err(|e| format!("Failed to run {bin}: {e}"))?;
+
+    if !output.status.success() {
+        // First non-empty line of either stream is the human-readable reason
+        // ("Failed to initialize NVML: Driver/library version mismatch", ...).
+        let msg = [output.stderr.as_slice(), output.stdout.as_slice()]
+            .iter()
+            .flat_map(|b| {
+                String::from_utf8_lossy(b)
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| format!("{bin} exited with {}", output.status));
+        return Err(msg);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// xpu-smi CSV in XPU_QUERY order. Current Intel drivers report an
+/// unsupported GPU temperature as 0.00 rather than N/A; show no reading
+/// instead of a fake 0°.
+fn parse_xpu_csv(text: &str) -> Vec<GpuStats> {
+    let mut gpus = parse_csv(text);
+    for g in &mut gpus {
+        if g.temperature == Some(0.0) {
+            g.temperature = None;
+        }
+    }
+    gpus
 }
 
 impl GpuBackend {
@@ -165,10 +198,12 @@ impl GpuBackend {
         }
         if GpuMonitor::collect_nvidia().is_ok_and(|gpus| !gpus.is_empty()) {
             Self::NvidiaSmi
+        } else if GpuMonitor::collect_xpu().is_ok_and(|gpus| !gpus.is_empty()) {
+            Self::Xpu
         } else {
             let devices = amd_devices();
             if devices.is_empty() {
-                // Preserve nvidia-smi's useful error when neither backend exists.
+                // Preserve nvidia-smi's useful error when no backend exists.
                 Self::NvidiaSmi
             } else {
                 Self::Amd(devices)
@@ -180,6 +215,7 @@ impl GpuBackend {
         match self {
             Self::Nvml(_) => "nvml",
             Self::NvidiaSmi => "smi",
+            Self::Xpu => "xpu",
             Self::Amd(_) => "amd",
         }
     }
@@ -188,6 +224,7 @@ impl GpuBackend {
         match self {
             Self::Nvml(session) => session.collect_stats(),
             Self::NvidiaSmi => GpuMonitor::collect_nvidia(),
+            Self::Xpu => GpuMonitor::collect_xpu(),
             Self::Amd(devices) => collect_amd(devices),
         }
     }
@@ -559,6 +596,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_real_xpu_smi_csv() {
+        // Captured from an Intel Arc Pro B70 (4 GPUs) running vLLM on
+        // device 0. Column order matches XPU_QUERY. utilization.gpu is
+        // N/A on this driver (only the memory-controller busy % works),
+        // fan and PCIe report N/A / -1.
+        let csv = std::fs::read_to_string("fixtures/xpu-smi-query-gpu.csv").unwrap();
+        let s = parse_xpu_csv(&csv);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0].index, 0);
+        assert_eq!(s[0].name, "Intel(R) Arc(TM) Pro B70 Graphics");
+        assert_eq!(s[0].mem_total_mb, 32656);
+        assert_eq!(s[0].mem_used_mb, 30759); // fractional MiB truncates
+        assert_eq!(s[0].mem_free_mb, 1896);
+        assert_eq!(s[0].utilization_gpu, 0.0); // N/A → 0, panel degrades
+        assert_eq!(s[0].utilization_mem, 94.19);
+        assert_eq!(s[0].power_watts, 48.48);
+        assert_eq!(s[0].power_max_watts, 230.0);
+        assert_eq!(s[0].temperature, None); // 0.00 is "unsupported", not 0°
+        assert_eq!(s[0].clock_sm_mhz, 1200); // clocks.current.graphics
+        assert_eq!(s[0].clock_sm_max_mhz, 2800); // clocks.max.graphics
+        assert_eq!(s[0].clock_mem_mhz, 400); // clocks.current.media
+        assert_eq!(s[0].fan_pct, None); // N/A
+        assert_eq!(s[0].pcie_gen, 0); // -1 → 0 so the panel hides the tag
+        assert_eq!(s[0].pcie_width, 0);
+        assert_eq!(s[0].vram_percent() as u32, 94);
+    }
+
+    #[test]
+    fn parse_xpu_smi_error_line_is_skipped() {
+        // xpu-smi prints [Error] lines on stdout for bad field sets;
+        // those rows must not become GPUs.
+        assert!(parse_csv("[Error] No valid metrics matched: 'x'\n").is_empty());
+    }
+
+    #[test]
     fn demo_walk_is_bounded() {
         let mut g = DemoGpu::new(1);
         for _ in 0..200 {
@@ -635,5 +707,27 @@ mod tests {
         assert_eq!(stats.pcie_gen, 4);
         assert_eq!(stats.pcie_width, 16);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "live check: run on a host with real GPUs"]
+    fn collects_live_gpu_stats() {
+        let stats = GpuBackend::detect(crate::nvml::NvmlSession::new())
+            .collect()
+            .expect("gpu monitor returned an error");
+        for g in &stats {
+            eprintln!(
+                "gpu: idx={} name='{}' vram={}/{}MB util_gpu={} util_mem={} {}W/{}W temp={:?} clk={}/{}MHz",
+                g.index, g.name, g.mem_used_mb, g.mem_total_mb, g.utilization_gpu,
+                g.utilization_mem, g.power_watts, g.power_max_watts, g.temperature,
+                g.clock_sm_mhz, g.clock_sm_max_mhz
+            );
+        }
+        assert!(!stats.is_empty(), "no GPUs found by any backend");
     }
 }

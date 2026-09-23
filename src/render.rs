@@ -64,7 +64,7 @@ pub struct Dashboard<'a> {
     pub demo: bool,
     /// Real routing from the patched server, when available.
     pub experts: Option<&'a ExpertStats>,
-    /// GPU telemetry backend: "nvml", "smi", or "demo".
+    /// GPU telemetry backend: "nvml", "smi", "xpu", "amd", or "demo".
     pub gpu_backend: Option<&'a str>,
     /// The settings screen, drawn over the view while it is open.
     pub settings: Option<&'a SettingsForm>,

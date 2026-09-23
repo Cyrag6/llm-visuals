@@ -269,6 +269,15 @@ fn is_vllm_phantom(process_name: &str, cmdline: &str) -> bool {
     if process_name.starts_with("VLLM::") || process_name.starts_with("docker") {
         return true;
     }
+    // A container entrypoint often launches vLLM through an interpreter
+    // (`python3 /opt/venv/bin/vllm serve …`), so argv0 is `python3` and the
+    // tokens contain no `vllm.entrypoints`; the comm still names the server.
+    if Path::new(process_name)
+        .file_name()
+        .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case("vllm"))
+    {
+        return false;
+    }
     // The real server is the `vllm` launcher or the python module form,
     // whatever its comm says (python3, pt_main_thread, or a full
     // executable path on the nvidia-smi side). Wrapper scripts and
@@ -589,6 +598,18 @@ pub fn detect_models() -> Vec<DetectedModel> {
             // below) reads the host-side file.
             let path = if !path.exists() {
                 resolve_container_path(m.pid, &path)
+                    .or_else(|| {
+                        // Device-based re-anchoring needs the model's
+                        // filesystem in OUR mountinfo; from a container
+                        // (overlay root) it never appears. Read through
+                        // the server's own root instead — /proc/<pid>/root
+                        // reaches the path exactly as the server sees it,
+                        // whichever side of the namespace boundary we are
+                        // on (needs the same uid or root).
+                        let rel = path.strip_prefix("/").unwrap_or(&path);
+                        let via_root = PathBuf::from(format!("/proc/{}/root", m.pid)).join(rel);
+                        via_root.exists().then_some(via_root)
+                    })
                     .or_else(|| resolve_local_model_dir(&path, &m.name))
                     .unwrap_or(path)
             } else {
@@ -597,6 +618,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
             if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
                 load_gguf_metadata(m, path);
             } else if path.is_dir() {
+                // Keep the resolved dir (load_gguf_metadata does the same for
+                // a file) so the weight-size sum in main.rs can read it.
+                m.path = Some(path.clone());
                 // A safetensors dir has no GGUF header; read config.json
                 // so layers/heads/experts populate the same panels. vLLM
                 // and SGLang default context is max_position_embeddings
@@ -1841,6 +1865,38 @@ mod tests {
             "/opt/venv/bin/vllm",
             "/opt/venv/bin/vllm serve /model"
         ));
+        // An interpreter-launched container entrypoint: argv0 is python3
+        // and there is no vllm.entrypoints token, but the comm is `vllm`.
+        assert!(!is_vllm_phantom(
+            "vllm",
+            "/opt/venv/bin/python3 /opt/venv/bin/vllm serve /model --port 8000"
+        ));
+    }
+
+    #[test]
+    #[ignore = "live check: run on a host with real servers, e.g. docker run --pid:host"]
+    fn detects_live_servers() {
+        let models = detect_models();
+        for m in &models {
+            eprintln!(
+                "detected: pid={} comm={} engine={} name={:?} port={:?} layers={} heads={} experts={}/{} path={:?} cmdline={}",
+                m.pid, m.process_name, m.engine, m.name, m.port,
+                m.n_layers(), m.n_heads(), m.n_experts_used(), m.n_experts(),
+                m.path.as_ref().map(|p| p.display().to_string()),
+                m.cmdline.chars().take(120).collect::<String>()
+            );
+        }
+        assert!(
+            !models.is_empty(),
+            "no inference servers detected on this host"
+        );
+        // Topology must not fall back to the "1 layer" clamp when the
+        // served model is a safetensors dir: either GGUF or HF config
+        // metadata has to provide real numbers.
+        assert!(
+            models.iter().all(|m| m.n_layers() > 1),
+            "layer count fell back to 1 — topology metadata missing"
+        );
     }
 
     #[test]

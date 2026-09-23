@@ -40,8 +40,9 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 
 ## Quick start
 
-Requirements: a Rust toolchain (1.75+), `nvidia-smi` for NVIDIA GPU panels or
-the Linux amdgpu driver for AMD GPU panels, and a locally listening
+Requirements: a Rust toolchain (1.75+), `nvidia-smi` for NVIDIA GPU panels,
+`xpu-smi` for Intel GPU panels or the Linux amdgpu driver for AMD GPU panels,
+and a locally listening
 `llama-server` for throughput panels. Nothing at all is needed for demo mode.
 
 On Windows 11, see [Windows](#windows) for setup; on a Mac, see
@@ -410,8 +411,8 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | tok/J | decode tok/s ÷ summed GPU power draw |
 | cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—") |
 | request log | one record per `id_task`; averages from accumulated deltas |
-| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), or Linux amdgpu sysfs and hwmon, every poll |
-| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads` |
+| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), Intel `xpu-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll. Intel drivers currently report GPU util, fan and PCIe link as N/A and temperature as 0, so those read as 0% or blank |
+| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads`. vLLM and other safetensors servers: **estimate** from the summed size of the served directory's weight shards |
 | layers, heads, experts, MTP layers, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
 | layer → GPU | `--tensor-split` proportions |
 | layer activity | utilisation of the GPU the layer lives on, smoothed |

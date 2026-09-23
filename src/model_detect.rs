@@ -106,7 +106,6 @@ impl DetectedModel {
         self.mem_used_mb == 0 && self.path.is_none() && self.gguf.is_none()
     }
 
-    /// GGUF metadata, else HF config.json topology for safetensors dirs.
     pub fn n_layers(&self) -> usize {
         self.gguf.as_ref().map(|g| g.n_layers).unwrap_or(0)
     }
@@ -607,12 +606,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
                         // reaches the path exactly as the server sees it,
                         // whichever side of the namespace boundary we are
                         // on (needs the same uid or root).
-                        let via_root =
-                            PathBuf::from(format!("/proc/{}/root/{}", m.pid, path.display()));
-                        (via_root.exists()).then(|| {
-                            m.path = Some(via_root.clone());
-                            via_root
-                        })
+                        let rel = path.strip_prefix("/").unwrap_or(&path);
+                        let via_root = PathBuf::from(format!("/proc/{}/root", m.pid)).join(rel);
+                        via_root.exists().then_some(via_root)
                     })
                     .or_else(|| resolve_local_model_dir(&path, &m.name))
                     .unwrap_or(path)
@@ -622,6 +618,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
             if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
                 load_gguf_metadata(m, path);
             } else if path.is_dir() {
+                // Keep the resolved dir (load_gguf_metadata does the same for
+                // a file) so the weight-size sum in main.rs can read it.
+                m.path = Some(path.clone());
                 // A safetensors dir has no GGUF header; read config.json
                 // so layers/heads/experts populate the same panels. vLLM
                 // and SGLang default context is max_position_embeddings

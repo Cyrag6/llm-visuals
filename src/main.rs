@@ -973,8 +973,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Total bytes of the model weight files inside a served directory
-/// (`*.safetensors`, `*.gguf`, `*.bin`). Symlinks count at their target's
-/// size; unreadable entries are skipped.
+/// (`*.safetensors`, `*.gguf`, `pytorch_model*.bin`). Symlinks count at
+/// their target's size, since an HF cache snapshot is all symlinks into
+/// `blobs/`; unreadable entries are skipped.
 fn dir_model_bytes(dir: &std::path::Path) -> Option<u64> {
     let mut total = 0u64;
     let mut any = false;
@@ -986,7 +987,8 @@ fn dir_model_bytes(dir: &std::path::Path) -> Option<u64> {
         if !is_model {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
+        // DirEntry::metadata does not follow symlinks on Unix.
+        if let Ok(meta) = std::fs::metadata(entry.path()) {
             if meta.is_file() {
                 total += meta.len();
                 any = true;
@@ -1124,7 +1126,9 @@ mod tests {
 
     #[test]
     fn dir_model_bytes_sums_weight_shards_only() {
-        let dir = std::env::temp_dir().join("llm-visuals-test-dirmodel");
+        let root =
+            std::env::temp_dir().join(format!("llm-visuals-test-dirmodel-{}", std::process::id()));
+        let dir = root.join("model");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("model-00001-of-00002.safetensors"),
@@ -1144,8 +1148,21 @@ mod tests {
         std::fs::write(dir.join("notes.bin"), b"x").unwrap();
         assert_eq!(dir_model_bytes(&dir), Some(5500));
 
+        // HF cache layout: snapshot entries are symlinks into blobs/.
+        #[cfg(unix)]
+        {
+            let blobs = root.join("blobs");
+            let snap = root.join("snapshot");
+            std::fs::create_dir_all(&blobs).unwrap();
+            std::fs::create_dir_all(&snap).unwrap();
+            std::fs::write(blobs.join("abc123"), vec![0u8; 4096]).unwrap();
+            std::os::unix::fs::symlink(blobs.join("abc123"), snap.join("model.safetensors"))
+                .unwrap();
+            assert_eq!(dir_model_bytes(&snap), Some(4096));
+        }
+
         // Empty dir (no weight files) → None so the mem_used fallback fires.
-        let empty = std::env::temp_dir().join("llm-visuals-test-dirmodel-empty");
+        let empty = root.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         std::fs::write(empty.join("config.json"), "{}").unwrap();
         assert_eq!(dir_model_bytes(&empty), None);
@@ -1156,8 +1173,7 @@ mod tests {
             None
         );
 
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&empty).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     const CANNED_VLLM_MODELS: &str = r#"{"object":"list","data":[{"id":"test-model","object":"model","created":1789774371,"owned_by":"vllm","max_model_len":4096}]}"#;
